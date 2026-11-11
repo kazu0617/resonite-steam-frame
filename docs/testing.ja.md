@@ -10,7 +10,10 @@ mikktspaceの追加前には、ARM64 .NETの分離プロセスからゲーム同
 
 18件の単体テストで、起動スクリプトの既知形式と未知形式の扱い、VDFの読み書き、取得アーカイブのパス検査、バックアップからの復元、導入後の変更を上書きしないこと、ほかのアプリの設定保持、起動中ガード、同時実行の拒否、x64環境での適用拒否、更新後も最初のバックアップへ戻せること、更新途中で止まった場合の復元、動画ランチャーの引数の保持などを確認しました。
 
+`install.sh` を変更する場合は `src/resonite_frame.py` を編集し、次のコマンドで生成・検証します。
+
 ```bash
+python3 tools/build_installer.py
 python3 -m unittest discover -s tests -v
 python3 tools/build_installer.py --check
 bash -n install.sh
