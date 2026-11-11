@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import subprocess
 from pathlib import Path
 import sys
 import tarfile
@@ -157,6 +158,67 @@ class InstallerTests(unittest.TestCase):
         files = [{'name': 'dotnet-apphost-pack-linux-arm64.tar.gz', 'rid': 'linux-arm64'}, {'name': 'dotnet-runtime-linux-arm64.tar.gz', 'rid': 'linux-arm64'}]
         self.assertIs(rf.dotnet_download_file({'runtime': {'files': files}}), files[1])
 
+
+    def test_upgrade_restores_first_originals_and_preserves_other_settings(self):
+        file = self.root/'library'
+        file.write_bytes(b'original')
+        file.chmod(0o640)
+        config = self.root/'config.vdf'
+        config.write_text(rf.vdf_dump({'app': {'launch': 'original'}, 'other': 'keep'}))
+        first = rf.Transaction(self.root/'state', {})
+        first.put(file, b'v1')
+        first.put_vdf(config, ('app',), {'launch': 'v1'})
+        second = rf.Transaction(self.root/'state', {}, previous=first.data)
+        second.put(file, b'v2', 0o755)
+        second.put(self.root/'new-tool', b'added', 0o755)
+        second.put_vdf(config, ('app',), {'launch': 'v2'})
+        config.write_bytes(rf.vdf_edit(config.read_bytes(), (), {'other': 'later'}))
+        rf.restore_files(second.data)
+        self.assertEqual(file.read_bytes(), b'original')
+        self.assertEqual(file.stat().st_mode & 0o777, 0o640)
+        self.assertFalse((self.root/'new-tool').exists())
+        self.assertEqual(rf.vdf_load(config.read_text()), {'app': {'launch': 'original'}, 'other': 'later'})
+
+    def test_interrupted_upgrade_before_write_can_restore_original(self):
+        file = self.root/'library'
+        file.write_bytes(b'original')
+        first = rf.Transaction(self.root/'state', {})
+        first.put(file, b'v1')
+        second = rf.Transaction(self.root/'state', {}, previous=first.data)
+        atomic = rf.atomic
+        def fail_at_target(path, data, mode=0o644):
+            if path == file:
+                raise OSError('simulated interruption after journal save')
+            return atomic(path, data, mode)
+        with patch.object(rf, 'atomic', side_effect=fail_at_target):
+            with self.assertRaises(OSError):
+                second.put(file, b'v2')
+        journal = json.loads((self.root/'state/manifest.json').read_text())
+        rf.restore_files(journal)
+        self.assertEqual(file.read_bytes(), b'original')
+
+    def test_video_launcher_preserves_arguments_and_controls_update(self):
+        game = self.root/'game with spaces'
+        tools = game/'dotnet-runtime-arm64/tools'
+        tools.mkdir(parents=True)
+        tool = tools/'yt-dlp_linux_aarch64'
+        tool.write_text('#!/bin/sh\nprintf "<%s>\\n" "$@"\ncommand -v deno\n')
+        tool.chmod(0o755)
+        deno = tools/'deno'
+        deno.write_text('#!/bin/sh\nexit 0\n')
+        deno.chmod(0o755)
+        launcher = game/'RuntimeData/yt-dlp_linux'
+        launcher.parent.mkdir()
+        launcher.write_text(rf.VIDEO_LAUNCHER)
+        launcher.chmod(0o755)
+        update = subprocess.run([str(launcher), '-U', '--update-to', 'nightly'], text=True, capture_output=True)
+        self.assertEqual(update.returncode, 0)
+        result = subprocess.run([str(launcher), '--js-runtimes', 'deno', 'https://example.com/a b?c=$var'], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[:3], ['<--js-runtimes>', '<deno>', '<https://example.com/a b?c=$var>'])
+        self.assertEqual(Path(result.stdout.splitlines()[3]).resolve(), deno)
+        mixed = subprocess.run([str(launcher), '-U', 'https://example.com/video'], capture_output=True)
+        self.assertNotEqual(mixed.returncode, 0)
 
 if __name__ == '__main__':
     unittest.main()

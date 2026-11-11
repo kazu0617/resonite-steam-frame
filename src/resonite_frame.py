@@ -21,15 +21,27 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+import zipfile
 from urllib.parse import urlparse
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 APP_ID = "2519830"
 TESTED_BUILD = "26579448"
 DOTNET_VERSION = "10.0.15"
 MIKK_COMMIT = "a25b708d852d88848d4c729677cd8dbad4526523"
 MIKK_URL = f"https://api.github.com/repos/Yellow-Dog-Man/Mikktspace.NET/tarball/{MIKK_COMMIT}"
 MIKK_SHA256 = "987e5056e13468ca2375ce8400329af36ec0dc22090f15e42c31f9c74599d250"
+CMP_COMMIT = "090a9c123a7100c1f1283fb3a7fbb8aa1c82b039"
+CMP_URL = f"https://api.github.com/repos/Yellow-Dog-Man/compressonator/tarball/{CMP_COMMIT}"
+CMP_SHA256 = "bfd9d475b8576950986265e09f3569f5e39ebc65ed488ba17ac1c40a062ca54d"
+CMP_LIBS = ("libCMP_Framework.so", "libCMP_Compressonator.so")
+YTDLP_VERSION = "2026.10.26"
+YTDLP_URL = f"https://github.com/yt-dlp/yt-dlp/releases/download/{YTDLP_VERSION}/yt-dlp_linux_aarch64"
+YTDLP_SHA256 = "e87e9533e89fe5889abaa21f5114dfe7756d6aa6219b83551add04d48b18e483"
+DENO_VERSION = "2.9.8"
+DENO_URL = f"https://github.com/denoland/deno/releases/download/v{DENO_VERSION}/deno-aarch64-unknown-linux-gnu.zip"
+DENO_SHA256 = "d49596c20b9788cf8f5d8ddf644103d4bde56ed239753f0bdb92ba9361d51905"
+DENO_BINARY_SHA256 = "b484f780e5149ca05c673f1f79f7fb466f12a2295933bdad917af4a8a5c020e8"
 OPENSSL_CONF = """openssl_conf = openssl_init
 [openssl_init]
 providers = provider_sect
@@ -457,10 +469,10 @@ def entry_value(entry):
 
 
 class Transaction:
-    def __init__(self, root, metadata):
+    def __init__(self, root, metadata, previous=None):
         self.root = root
         self.path = root/"manifest.json"
-        self.data = {"version": VERSION, "status": "applying", "files": [], **metadata}
+        self.data = {"version": VERSION, "status": "applying", "files": json.loads(json.dumps(previous["files"])) if previous else [], **metadata}
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         root.chmod(0o700)
         self.backups = root/"backups"/str(time.time_ns())
@@ -476,12 +488,19 @@ class Transaction:
         after = {"kind": "file", "sha256": digest(data), "mode": mode}
         if before == after:
             return
-        entry = {"path": str(path), "before": before, "after": after, "applied": False}
-        if before["kind"] == "file":
-            backup = self.backups/str(len(self.data["files"]))
-            atomic(backup, path.read_bytes(), 0o600)
-            entry["backup"] = str(backup)
-        self.data["files"].append(entry)
+        entry = next((e for e in self.data["files"] if e["path"] == str(path)), None)
+        if entry:
+            if entry.get("type") == "vdf" or before != entry["after"]:
+                raise SetupError(f"File changed before upgrade: {path}")
+            entry.setdefault("previous_after", []).append(before)
+            entry.update(after=after, applied=False)
+        else:
+            entry = {"path": str(path), "before": before, "after": after, "applied": False}
+            if before["kind"] == "file":
+                backup = self.backups/str(len(self.data["files"]))
+                atomic(backup, path.read_bytes(), 0o600)
+                entry["backup"] = str(backup)
+            self.data["files"].append(entry)
         self.save()  # Journal before the write, including a recoverable original.
         if snapshot(path) != before:
             raise SetupError(f"File changed during installation: {path}")
@@ -494,11 +513,18 @@ class Transaction:
         before = vdf_values(path, keys, changes)
         if before == changes:
             return
-        backup = self.backups/str(len(self.data["files"]))
-        atomic(backup, original, 0o600)
-        entry = {"type": "vdf", "path": str(path), "keys": keys, "before": before,
-                 "after": changes, "backup": str(backup), "backup_sha256": digest(original), "applied": False}
-        self.data["files"].append(entry)
+        entry = next((e for e in self.data["files"] if e["path"] == str(path)), None)
+        if entry:
+            if entry.get("type") != "vdf" or tuple(entry["keys"]) != tuple(keys) or before != entry["after"]:
+                raise SetupError("Steam settings changed before upgrade")
+            entry.setdefault("previous_after", []).append(before)
+            entry.update(after=changes, applied=False)
+        else:
+            backup = self.backups/str(len(self.data["files"]))
+            atomic(backup, original, 0o600)
+            entry = {"type": "vdf", "path": str(path), "keys": keys, "before": before,
+                     "after": changes, "backup": str(backup), "backup_sha256": digest(original), "applied": False}
+            self.data["files"].append(entry)
         self.save()
         if path.read_bytes() != original:
             raise SetupError("Steam configuration changed during the write")
@@ -511,7 +537,7 @@ def validate_restore(data):
     # Verify every file before restoring any, avoiding a partially forced rollback.
     for entry in data["files"]:
         current = entry_value(entry)
-        if current not in (entry["after"], entry["before"]):
+        if current not in [entry["after"], entry["before"], *entry.get("previous_after", [])]:
             raise SetupError(f"導入後に変更されたファイルがあります。自動復元しません: {entry['path']}")
         expected_backup = entry.get("backup_sha256") if entry.get("type") == "vdf" else entry["before"].get("sha256")
         if expected_backup and digest(Path(entry["backup"]).read_bytes()) != expected_backup:
@@ -525,7 +551,7 @@ def restore_files(data):
         current = entry_value(entry)
         if current == entry["before"]:
             continue
-        if current != entry["after"]:
+        if current not in [entry["after"], *entry.get("previous_after", [])]:
             raise SetupError(f"File changed during restoration: {path}")
         if entry.get("type") == "vdf":
             if "steam" in data and steam_running(Path(data["steam"])):
@@ -693,6 +719,147 @@ def stage_mikk(game, stage, cache):
     return destination
 
 
+# yt-dlp is invoked by the native engine. Keep its updater from replacing the
+# installer-managed ARM64 binary; Resonite's small-file rollback restores the
+# same launcher from .backup. Arguments for normal extraction stay intact.
+VIDEO_LAUNCHER = '''#!/bin/sh
+set -eu
+tools="${0%/*}/../dotnet-runtime-arm64/tools"
+update=0
+for arg do
+    case "$arg" in -U|--update|--update-to|--update-to=*) update=1;; esac
+done
+if [ "$update" = 1 ]; then
+    for arg do
+        case "$arg" in -U|--update|--update-to|nightly|--update-to=nightly) ;;
+            *) echo 'Update yt-dlp with the Resonite Frame installer.' >&2; exit 2;;
+        esac
+    done
+    echo 'yt-dlp is managed by the Resonite Frame installer.'
+    exit 0
+fi
+PATH="$tools:$PATH"
+export PATH
+exec "$tools/yt-dlp_linux_aarch64" "$@"
+'''
+
+CMP_PROBE = r'''
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+#include "compressonator.h"
+int main() {
+    std::vector<unsigned char> pixels(16 * 16 * 4);
+    for (size_t i = 0; i < pixels.size(); i += 4) {
+        pixels[i] = 80; pixels[i+1] = 140; pixels[i+2] = 210; pixels[i+3] = 255;
+    }
+    for (auto format : {CMP_FORMAT_BC1, CMP_FORMAT_BC3, CMP_FORMAT_BC7}) {
+        CMP_Texture source = {}, encoded = {}, decoded = {};
+        for (auto texture : {&source, &encoded, &decoded}) {
+            texture->dwSize = sizeof(CMP_Texture);
+            texture->dwWidth = texture->dwHeight = 16;
+            texture->nBlockWidth = texture->nBlockHeight = 4;
+            texture->nBlockDepth = 1;
+        }
+        source.format = decoded.format = CMP_FORMAT_RGBA_8888;
+        source.dwPitch = decoded.dwPitch = 64;
+        source.dwDataSize = pixels.size(); source.pData = pixels.data();
+        encoded.format = format;
+        encoded.dwDataSize = CMP_CalculateBufferSize(&encoded);
+        if (encoded.dwDataSize != (format == CMP_FORMAT_BC1 ? 128 : 256)) return 1;
+        std::vector<unsigned char> blocks(encoded.dwDataSize), result(pixels.size());
+        encoded.pData = blocks.data();
+        decoded.dwDataSize = result.size(); decoded.pData = result.data();
+        CMP_CompressOptions options = {};
+        options.dwSize = sizeof(options); options.fquality = 1;
+        options.dwnumThreads = 1; options.bDisableMultiThreading = true;
+        if (CMP_ConvertTexture(&source, &encoded, &options, nullptr) != CMP_OK) return 2;
+        if (CMP_ConvertTexture(&encoded, &decoded, &options, nullptr) != CMP_OK) return 3;
+        int error = 0;
+        for (size_t i = 0; i < pixels.size(); ++i)
+            error = std::max(error, std::abs(int(pixels[i]) - int(result[i])));
+        if (error > 12) return 4;
+        std::printf("Compressonator format=%d bytes=%u max_error=%d: OK\n", format, encoded.dwDataSize, error);
+    }
+}
+'''
+
+
+def patch_compressonator(source):
+    header = source/"cmp_core/shaders/bc1_cmp.h"
+    original = header.read_text()
+    marker = "CMP_STATIC bool bc1ToggleSIMD(CGU_INT newExtension)\n{"
+    end = "    return result;\n}\n#endif"
+    if original.count(marker) != 1 or original.count(end) != 1:
+        raise SetupError("CompressonatorのSIMD切り替え箇所が想定と異なります。")
+    modified = original.replace(marker, marker + "\n#if defined(__aarch64__) || defined(_M_ARM64) || defined(CMP_ARM64_BUILD)\n"
+        "    cpu_bc1ComputeBestEndpoints = _cpu_bc1ComputeBestEndpoints;\n"
+        "    g_bc1FunctionPointersSet = true;\n"
+        "    return newExtension == EXTENSION_NONE || newExtension == EXTENSION_COUNT;\n#else", 1)
+    header.write_text(modified.replace(end, "    return result;\n#endif\n}\n#endif", 1))
+    plugin = source/"applications/_plugins/common/pluginbase.h"
+    original = plugin.read_text()
+    if original.count("#include <memory>") != 1:
+        raise SetupError("Compressonatorのヘッダーが想定と異なります。")
+    plugin.write_text(original.replace("#include <memory>", "#include <cstdint>\n#include <memory>", 1))
+
+
+def stage_compressonator(stage, cache):
+    archive = cache/f"compressonator-{CMP_COMMIT}.tar.gz"
+    download(CMP_URL, archive, CMP_SHA256)
+    source, build = stage/"source", stage/"build"
+    unpack(archive, source, strip=1)
+    patch_compressonator(source)
+    print("画像変換ライブラリをARM64向けにビルドします。数分かかります。", flush=True)
+    with (stage/"build.log").open("w") as log:
+        try:
+            subprocess.run(["cmake", "-S", str(source), "-B", str(build),
+                "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+                "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,defs", "-DBUILD_SHARED_LIBS=ON",
+                "-DOPTION_ENABLE_ALL_APPS=OFF", "-DOPTION_BUILD_CMP_SDK=ON",
+                "-DOPTION_CMP_QT=OFF", "-DOPTION_BUILD_GUI=OFF", "-DOPTION_BUILD_KTX2=OFF",
+                "-DOPTION_BUILD_EXR=OFF", "-DOPTION_BUILD_INTERNAL_CMP_TEST=OFF",
+                "-DENABLE_AVX512=OFF"], stdout=log, stderr=subprocess.STDOUT, check=True)
+            subprocess.run(["cmake", "--build", str(build), "--target", "CMP_Compressonator", "-j2"],
+                stdout=log, stderr=subprocess.STDOUT, check=True)
+        except subprocess.CalledProcessError:
+            log.flush()
+            atomic(cache/"compressonator-build.log", (stage/"build.log").read_bytes(), 0o600)
+            raise SetupError(f"画像変換ライブラリのビルドに失敗しました。ログ: {cache/'compressonator-build.log'}")
+    for name in CMP_LIBS:
+        if not elf_arm64(build/"lib"/name):
+            raise SetupError("Built Compressonator is not ARM64")
+    probe = stage/"probe.cpp"
+    probe.write_text(CMP_PROBE)
+    subprocess.run(["c++", str(probe), "-I" + str(source/"cmp_compressonatorlib"),
+        "-L" + str(build/"lib"), "-lCMP_Compressonator", "-lCMP_Framework",
+        "-Wl,-rpath," + str(build/"lib"), "-o", str(stage/"probe")], check=True)
+    subprocess.run([str(stage/"probe")], env=dict(os.environ, LD_LIBRARY_PATH=str(build/"lib")), timeout=60, check=True)
+    return build/"lib"
+
+
+def stage_video(stage, cache):
+    binary = cache/f"yt-dlp-{YTDLP_VERSION}-linux-aarch64"
+    download(YTDLP_URL, binary, YTDLP_SHA256)
+    atomic(stage/"yt-dlp_linux_aarch64", binary.read_bytes(), 0o755)
+    archive = cache/f"deno-{DENO_VERSION}-aarch64.zip"
+    download(DENO_URL, archive, DENO_SHA256)
+    with zipfile.ZipFile(archive) as bundle:
+        entries = bundle.infolist()
+        if len(entries) != 1 or entries[0].filename != "deno" or entries[0].file_size > 128 * 1024 * 1024:
+            raise SetupError("Unexpected Deno archive contents")
+        data = bundle.read("deno")
+    if digest(data) != DENO_BINARY_SHA256:
+        raise SetupError("Deno binary checksum mismatch")
+    atomic(stage/"deno", data, 0o755)
+    for name in ("yt-dlp_linux_aarch64", "deno"):
+        if not elf_arm64(stage/name):
+            raise SetupError(f"Video tool is not ARM64: {name}")
+        subprocess.run([str(stage/name), "--version"], capture_output=True, timeout=30, check=True)
+    return stage
+
+
 def helper_source(state_root):
     return ("#!/usr/bin/env python3\nimport sys\n" + f"sys.path.insert(0, {str(state_root/'lib')!r})\n" + "from resonite_frame import launch\n" + f"launch({str(state_root)!r})\n").encode()
 
@@ -730,6 +897,9 @@ def check(game, app, state_root):
               "runtime_version_available": (game/f"dotnet-runtime-arm64/shared/Microsoft.NETCore.App/{DOTNET_VERSION}/libcoreclr.so").is_file(),
               "support_libraries": {name: (game/"frame-libs-arm64"/name).is_file() for name in ["libicuuc.so", "libssl.so.3", "libcrypto.so.3", "libpulse.so.0", "ossl-modules/legacy.so", "openssl.cnf"]},
               "mikktspace_arm64": (game/"runtimes/linux-arm64/native/libmikktspace.so").is_file() and elf_arm64(game/"runtimes/linux-arm64/native/libmikktspace.so")}
+    result["video_tools_arm64"] = {name: (game/"dotnet-runtime-arm64/tools"/name).is_file() and elf_arm64(game/"dotnet-runtime-arm64/tools"/name) for name in ("yt-dlp_linux_aarch64", "deno")}
+    result["video_launcher"] = (game/"RuntimeData/yt-dlp_linux").is_file() and (game/"RuntimeData/yt-dlp_linux").read_bytes() == VIDEO_LAUNCHER.encode()
+    result["compressonator_arm64"] = {name: (game/"runtimes/linux-arm64/native"/name).is_file() and elf_arm64(game/"runtimes/linux-arm64/native"/name) for name in CMP_LIBS}
     try:
         patch_bootstrap((game/"LinuxBootstrap.sh").read_text())
         result["bootstrap_supported"] = True
@@ -737,7 +907,7 @@ def check(game, app, state_root):
         result["bootstrap_supported"] = False
     print(json.dumps(result, ensure_ascii=False, indent=2))
     # This is a readiness report, not a live VR/gameplay test.
-    return 0 if result["tested_build"] and result["runtime_arm64"] and result["runtime_version_available"] and all(result["support_libraries"].values()) and result["mikktspace_arm64"] and result["bootstrap_supported"] else 1
+    return 0 if result["tested_build"] and result["runtime_arm64"] and result["runtime_version_available"] and all(result["support_libraries"].values()) and result["mikktspace_arm64"] and result["bootstrap_supported"] and result["video_launcher"] and all(result["video_tools_arm64"].values()) and all(result["compressonator_arm64"].values()) else 1
 
 
 def uninstall(state_root):
@@ -785,10 +955,10 @@ def install(args, steam, game, app, state_root):
     required = tuple(int(n) for n in frameworks[0]["version"].split("."))
     if required[:2] != (10, 0) or required > tuple(int(n) for n in DOTNET_VERSION.split(".")):
         raise SetupError("このゲームは固定した.NET runtimeより新しい版を要求しています。")
-    for command in ("c++", "ldd"):
+    for command in ("c++", "ldd", "cmake", "make"):
         if not shutil.which(command):
             raise SetupError(f"{command} が必要です。システムパッケージは自動変更しません。")
-    if not any((root/"steamapps/common/Proton - Experimental/compatibilitytool.vdf").is_file() for root in libraries(steam)):
+    if not any(all((root/"steamapps/common/Proton - Experimental"/name).is_file() for name in ("proton", "toolmanifest.vdf")) for root in libraries(steam)):
         raise SetupError("SteamのライブラリからProton Experimentalを先にインストールしてください。")
     script = game/"LinuxBootstrap.sh"
     original = script.read_bytes()
@@ -797,16 +967,24 @@ def install(args, steam, game, app, state_root):
     helper = (Path(args.bin_dir).expanduser().absolute() if args.bin_dir else Path.home()/".local/bin")/"frame-resonite-launch"
     wanted = {"launch": launch_options(settings.before["launch"], helper), "compat": "proton_experimental"}
     manifest = state_root/"manifest.json"
+    previous = None
     if manifest.is_file():
         data = json.loads(manifest.read_text())
         if data["status"] == "installed" and data["game"] == str(game):
             if all(entry_value(e) == e["after"] for e in data["files"]) and settings.read() == data["settings_after"]:
-                print("すでに導入済みです。変更はありません。")
-                return
-            raise SetupError("導入後にファイルか設定が変わっています。バックアップを確認してから復元・再導入してください。")
-        if data["status"] != "uninstalled":
+                if data["version"] == VERSION:
+                    print("すでに導入済みです。変更はありません。")
+                    return
+                if data["version"] != "0.1.0":
+                    raise SetupError("この導入記録からの更新には対応していません。復元してから再導入してください。")
+                if data["settings_mode"] != settings.mode or data["steam"] != str(steam):
+                    raise SetupError("更新時は前回と同じSteam環境・設定方法を使ってください。Steamを終了して導入した場合は、更新時も終了してください。")
+                previous = data
+            else:
+                raise SetupError("導入後にファイルか設定が変わっています。バックアップを確認してから復元・再導入してください。")
+        if not previous and data["status"] != "uninstalled":
             raise SetupError("前回の導入が途中で止まっています。--uninstall で復元してから再実行してください。")
-        archived = state_root/f"manifest-uninstalled-{time.time_ns()}.json"
+        archived = state_root/f"manifest-previous-{time.time_ns()}.json"
         shutil.copy2(manifest, archived)
     state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     cache = state_root/"cache"
@@ -819,11 +997,14 @@ def install(args, steam, game, app, state_root):
         stage_host_libraries(support)
         runtime = stage_runtime(game, stage/"runtime", cache)
         mikk = stage_mikk(game, stage/"mikk", cache)
+        video = stage_video(stage/"video", cache)
+        compressor = stage_compressonator(stage/"compressonator", cache)
         _, latest_app = find_game(steam, str(game))
         if game_running(game) or script.read_bytes() != original or settings.read() != settings.before or latest_app.get("buildid") != app.get("buildid") or latest_app.get("StateFlags") != "4":
             raise SetupError("準備中にゲームまたは設定の状態が変わりました。適用を中止しました。")
         tx = Transaction(state_root, {"game": str(game), "steam": str(steam), "build": app.get("buildid"), "app": {"LastOwner": app.get("LastOwner", "0")}, "user_id": args.user_id,
-                  "settings_mode": settings.mode, "settings_before": settings.before, "settings_after": wanted, "required": [], "source_commit": MIKK_COMMIT, "source_sha256": MIKK_SHA256, "dotnet_version": DOTNET_VERSION})
+                  "settings_mode": settings.mode, "settings_before": previous["settings_before"] if previous else settings.before, "settings_after": wanted, "required": [], "source_commit": MIKK_COMMIT, "source_sha256": MIKK_SHA256, "dotnet_version": DOTNET_VERSION,
+                  "compressonator_commit": CMP_COMMIT, "yt_dlp_version": YTDLP_VERSION, "deno_version": DENO_VERSION}, previous=previous)
         try:
             for source in sorted(support.rglob("*")):
                 if source.is_file():
@@ -836,6 +1017,17 @@ def install(args, steam, game, app, state_root):
                         tx.put(game/"dotnet-runtime-arm64"/source.relative_to(runtime), source.read_bytes(), source.stat().st_mode & 0o777)
             if mikk:
                 tx.put(game/"runtimes/linux-arm64/native/libmikktspace.so", mikk.read_bytes())
+            for name in ("yt-dlp_linux_aarch64", "deno"):
+                relative = Path("dotnet-runtime-arm64/tools")/name
+                tx.put(game/relative, (video/name).read_bytes(), 0o755)
+                tx.data["required"].append(str(relative))
+            for name in ("yt-dlp_linux", "yt-dlp_linux.backup"):
+                tx.put(game/"RuntimeData"/name, VIDEO_LAUNCHER.encode(), 0o755)
+                tx.data["required"].append("RuntimeData/" + name)
+            for name in CMP_LIBS:
+                relative = Path("runtimes/linux-arm64/native")/name
+                tx.put(game/relative, (compressor/name).read_bytes())
+                tx.data["required"].append(str(relative))
             tx.data["required"] += ["dotnet-runtime-arm64/dotnet", "runtimes/linux-arm64/native/libmikktspace.so"]
             tx.put(script, patched, script.stat().st_mode & 0o777)
             tx.put(state_root/"lib/resonite_frame.py", Path(__file__).read_bytes())
@@ -856,7 +1048,7 @@ def install(args, steam, game, app, state_root):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Steam Frame向けResonite起動・音声・FBXインポート対応")
+    parser = argparse.ArgumentParser(description="Steam Frame向けResonite起動・音声・モデル・動画・画像対応")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--check", action="store_true", help="変更せず準備状態を表示")
     modes.add_argument("--uninstall", action="store_true", help="記録した変更を復元")
