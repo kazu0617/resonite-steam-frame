@@ -84,4 +84,10 @@ bash -n install.sh
 
 `install.sh` は `src/resonite_frame.py` から生成する自己完結スクリプトです。変更後は生成し直してください。Frame上で隔離した導入・復元を試す方法は[テスト記録](docs/testing.ja.md)にあります。
 
-本ツールのコードはMIT Licenseです。Resonite、Microsoft .NET、各ネイティブライブラリにはそれぞれのライセンスが適用されます。[mikktspace](https://github.com/Yellow-Dog-Man/Mikktspace.NET)と[Compressonator](https://github.com/Yellow-Dog-Man/compressonator)はソースのコミットとアーカイブのSHA256を固定しています。[yt-dlp](https://github.com/yt-dlp/yt-dlp)と[Deno](https://github.com/denoland/deno)も固定版のSHA256を検証し、.NETはMicrosoftの配布メタデータにあるSHA512で確認します。
+## ライセンス・外部ソース
+
+- 本ツールのコードは[MIT License](LICENSE)です。
+- Resonite、Microsoft .NET、各ネイティブライブラリには、それぞれのライセンスが適用されます。
+- [mikktspace](https://github.com/Yellow-Dog-Man/Mikktspace.NET)と[Compressonator](https://github.com/Yellow-Dog-Man/compressonator)は、ソースのコミットとアーカイブのSHA256を固定しています。
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp)と[Deno](https://github.com/denoland/deno)は、固定版のSHA256を検証します。
+- .NETは、Microsoftの配布メタデータにあるSHA512で確認します。
