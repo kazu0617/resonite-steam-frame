@@ -32,9 +32,8 @@ import urllib.request
 import zipfile
 from urllib.parse import urlparse
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 APP_ID = "2519830"
-TESTED_BUILD = "26579448"
 DOTNET_VERSION = "10.0.15"
 MIKK_COMMIT = "a25b708d852d88848d4c729677cd8dbad4526523"
 MIKK_URL = f"https://api.github.com/repos/Yellow-Dog-Man/Mikktspace.NET/tarball/{MIKK_COMMIT}"
@@ -337,9 +336,15 @@ def live_settings():
 
 
 def local_config(steam, app, user_id=None):
-    paths = list(steam.glob("userdata/*/config/localconfig.vdf"))
-    owner = str(int(app.get("LastOwner", "0")) - 76561197960265728)
-    selected = user_id or owner
+    paths = sorted(p for p in steam.glob("userdata/*/config/localconfig.vdf") if p.parents[1].name.isdecimal())
+    selected = user_id
+    if selected is None:
+        try:
+            steam_id64 = int(app.get("LastOwner", "0"))
+        except (TypeError, ValueError):
+            steam_id64 = 0
+        # Steam's userdata directory uses the account ID in SteamID64's low 32 bits.
+        selected = str(steam_id64 & 0xFFFFFFFF) if steam_id64 > 0 else None
     match = next((p for p in paths if p.parents[1].name == selected), None)
     if match:
         return match
@@ -878,9 +883,6 @@ def launch(state_root):
         if state["status"] != "installed":
             raise SetupError("セットアップが完了していません。インストーラーの状態を確認してください。")
         game = Path(state["game"])
-        manifest = subtree(vdf_load((game.parents[1]/f"appmanifest_{APP_ID}.acf").read_text()), "AppState")
-        if manifest.get("buildid") != state["build"]:
-            raise SetupError("Resoniteが更新されました。新しいbuildを確認してから再導入してください。")
         for relative in state["required"]:
             if not (game/relative).is_file():
                 raise SetupError(f"Missing support file: {relative}")
@@ -899,7 +901,7 @@ def launch(state_root):
 
 
 def check(game, app, state_root):
-    result = {"game": str(game), "build": app.get("buildid"), "tested_build": app.get("buildid") == TESTED_BUILD,
+    result = {"game": str(game), "build": app.get("buildid"),
               "game_running": game_running(game), "installer_manifest": (state_root/"manifest.json").is_file(),
               "runtime_arm64": (game/"dotnet-runtime-arm64/dotnet").is_file() and elf_arm64(game/"dotnet-runtime-arm64/dotnet"),
               "runtime_version_available": (game/f"dotnet-runtime-arm64/shared/Microsoft.NETCore.App/{DOTNET_VERSION}/libcoreclr.so").is_file(),
@@ -915,7 +917,7 @@ def check(game, app, state_root):
         result["bootstrap_supported"] = False
     print(json.dumps(result, ensure_ascii=False, indent=2))
     # This is a readiness report, not a live VR/gameplay test.
-    return 0 if result["tested_build"] and result["runtime_arm64"] and result["runtime_version_available"] and all(result["support_libraries"].values()) and result["mikktspace_arm64"] and result["bootstrap_supported"] and result["video_launcher"] and all(result["video_tools_arm64"].values()) and all(result["compressonator_arm64"].values()) else 1
+    return 0 if result["runtime_arm64"] and result["runtime_version_available"] and all(result["support_libraries"].values()) and result["mikktspace_arm64"] and result["bootstrap_supported"] and result["video_launcher"] and all(result["video_tools_arm64"].values()) and all(result["compressonator_arm64"].values()) else 1
 
 
 def uninstall(state_root):
@@ -951,8 +953,6 @@ def install(args, steam, game, app, state_root):
         raise SetupError("Resoniteが起動中です。手動で終了してから実行してください。自動終了・再起動はしません。--check は起動中でも使えます。")
     if app.get("StateFlags") != "4":
         raise SetupError("Resoniteのインストール・更新が完了していません。Steamで完了を待ってください。")
-    if app.get("buildid") != TESTED_BUILD and not args.allow_untested_build:
-        raise SetupError(f"未検証のResonite build {app.get('buildid')} です。対応状況を確認してください。検証を承知して進める場合は --allow-untested-build を指定します。")
     runtime_config = json.loads((game/"Renderite.Host.runtimeconfig.json").read_text())
     if runtime_config["runtimeOptions"].get("tfm") != "net10.0":
         raise SetupError("この版は.NET 10を要求するResoniteだけに対応しています。")
@@ -983,8 +983,6 @@ def install(args, steam, game, app, state_root):
                 if data["version"] == VERSION:
                     print("すでに導入済みです。変更はありません。")
                     return
-                if data["version"] != "0.1.0":
-                    raise SetupError("この導入記録からの更新には対応していません。復元してから再導入してください。")
                 if data["settings_mode"] != settings.mode or data["steam"] != str(steam):
                     raise SetupError("更新時は前回と同じSteam環境・設定方法を使ってください。Steamを終了して導入した場合は、更新時も終了してください。")
                 previous = data
@@ -1010,7 +1008,7 @@ def install(args, steam, game, app, state_root):
         _, latest_app = find_game(steam, str(game))
         if game_running(game) or script.read_bytes() != original or settings.read() != settings.before or latest_app.get("buildid") != app.get("buildid") or latest_app.get("StateFlags") != "4":
             raise SetupError("準備中にゲームまたは設定の状態が変わりました。適用を中止しました。")
-        tx = Transaction(state_root, {"game": str(game), "steam": str(steam), "build": app.get("buildid"), "app": {"LastOwner": app.get("LastOwner", "0")}, "user_id": args.user_id,
+        tx = Transaction(state_root, {"game": str(game), "steam": str(steam), "build": app.get("buildid"), "app": {"LastOwner": app.get("LastOwner", "0")}, "user_id": settings.local.parents[1].name if settings.local else args.user_id,
                   "settings_mode": settings.mode, "settings_before": previous["settings_before"] if previous else settings.before, "settings_after": wanted, "required": [], "source_commit": MIKK_COMMIT, "source_sha256": MIKK_SHA256, "dotnet_version": DOTNET_VERSION,
                   "compressonator_commit": CMP_COMMIT, "yt_dlp_version": YTDLP_VERSION, "deno_version": DENO_VERSION}, previous=previous)
         try:
@@ -1064,8 +1062,7 @@ def main(argv=None):
     parser.add_argument("--game-dir")
     parser.add_argument("--state-dir", help="バックアップと導入記録の保存先")
     parser.add_argument("--bin-dir", help="起動ヘルパーの保存先。既定は ~/.local/bin")
-    parser.add_argument("--user-id")
-    parser.add_argument("--allow-untested-build", action="store_true")
+    parser.add_argument("--user-id", help="Steamのuserdata内のアカウント番号")
     args = parser.parse_args(argv)
     state_root = Path(args.state_dir).expanduser().absolute() if args.state_dir else Path(os.environ.get("XDG_DATA_HOME", str(Path.home()/".local/share")))/"resonite-steam-frame"
     try:

@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -31,7 +32,7 @@ class InstallerTests(unittest.TestCase):
     def test_bootstrap_known_and_manual_patch_are_idempotent(self):
         modified = rf.patch_bootstrap(BOOTSTRAP)
         self.assertEqual(rf.patch_bootstrap(modified), modified)
-        self.assertIn('--version 10.0.15', modified)
+        self.assertIn(f'--version {rf.DOTNET_VERSION}', modified)
         self.assertIn('OPENSSL_MODULES=', modified)
         manual = BOOTSTRAP.replace('dotnet-runtime"', 'dotnet-runtime-arm64"').replace('--runtime dotnet --install-dir', '--runtime dotnet --architecture arm64 --install-dir')
         self.assertEqual(rf.patch_bootstrap(manual), modified)
@@ -219,6 +220,119 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(Path(result.stdout.splitlines()[3]).resolve(), deno)
         mixed = subprocess.run([str(launcher), '-U', 'https://example.com/video'], capture_output=True)
         self.assertNotEqual(mixed.returncode, 0)
+
+    def make_local_config(self, steam, account):
+        path = steam/'userdata'/str(account)/'config/localconfig.vdf'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(rf.vdf_dump({'UserLocalConfigStore': {'Software': {'Valve': {'Steam': {'apps': {rf.APP_ID: {'LaunchOptions': '-Verbose'}}}}}}}))
+        return path
+
+    def make_steam_fixture(self):
+        steam = self.root/'Steam with spaces'
+        game = steam/'steamapps/common/Resonite'
+        game.mkdir(parents=True)
+        (game/'LinuxBootstrap.sh').write_text(BOOTSTRAP)
+        (game/'Renderite.Host.dll').write_bytes(b'fixture only')
+        tfm = 'net' + '.'.join(rf.DOTNET_VERSION.split('.')[:2])
+        (game/'Renderite.Host.runtimeconfig.json').write_text(json.dumps({'runtimeOptions': {'tfm': tfm, 'framework': {'name': 'Microsoft.NETCore.App', 'version': rf.DOTNET_VERSION}}}))
+        header = bytearray(64)
+        header[:6] = b'\x7fELF\x02\x01'
+        header[18:20] = (183).to_bytes(2, 'little')
+        required = ['dotnet-runtime-arm64/dotnet', f'dotnet-runtime-arm64/shared/Microsoft.NETCore.App/{rf.DOTNET_VERSION}/libcoreclr.so',
+            'runtimes/linux-arm64/native/libmikktspace.so', 'dotnet-runtime-arm64/tools/yt-dlp_linux_aarch64', 'dotnet-runtime-arm64/tools/deno']
+        required += ['runtimes/linux-arm64/native/' + name for name in rf.CMP_LIBS]
+        required += ['frame-libs-arm64/' + name for name in ('libicuuc.so', 'libssl.so.3', 'libcrypto.so.3', 'libpulse.so.0', 'ossl-modules/legacy.so', 'openssl.cnf')]
+        for relative in required:
+            path = game/relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(header)
+            path.chmod(0o755 if path.name in ('dotnet', 'deno', 'yt-dlp_linux_aarch64') else 0o644)
+        self.make_local_config(steam, 17)
+        self.make_local_config(steam, 425)
+        # A synthetic individual SteamID64, constructed from fields, not a real user.
+        owner = (1 << 56) | (1 << 52) | (1 << 32) | 425
+        app = {'appid': rf.APP_ID, 'installdir': 'Resonite', 'buildid': '1', 'StateFlags': '4', 'LastOwner': str(owner)}
+        (steam/f'steamapps/appmanifest_{rf.APP_ID}.acf').write_text(rf.vdf_dump({'AppState': app}))
+        experimental = steam/'steamapps/common/Proton - Experimental'
+        experimental.mkdir()
+        for name in ('proton', 'toolmanifest.vdf'):
+            (experimental/name).write_text('fixture only')
+        config = steam/'config/config.vdf'
+        config.parent.mkdir()
+        config.write_text(rf.vdf_dump({'InstallConfigStore': {'Software': {'Valve': {'Steam': {'CompatToolMapping': {rf.APP_ID: {'name': 'original'}}}}}}}))
+        args = SimpleNamespace(user_id=None, bin_dir=str(self.root/'bin'))
+        return steam, game, app, self.root/'state', args
+
+    def install_fixture(self, steam, game, app, state, args):
+        with patch.object(rf, 'game_running', return_value=False), patch.object(rf, 'steam_running', return_value=False), \
+             patch.object(rf, 'stage_host_libraries'), patch.object(rf, 'stage_runtime', return_value=None), \
+             patch.object(rf, 'stage_mikk', return_value=None), \
+             patch.object(rf, 'stage_video', return_value=game/'dotnet-runtime-arm64/tools'), \
+             patch.object(rf, 'stage_compressonator', return_value=game/'runtimes/linux-arm64/native'), \
+             patch('sys.stdout', new_callable=io.StringIO):
+            rf.install(args, steam, game, app, state)
+
+    def test_local_config_selects_each_accounts_userdata(self):
+        steam = self.root/'Steam'
+        prefix = (1 << 56) | (1 << 52) | (1 << 32)
+        for account in (17, 425):
+            self.make_local_config(steam, account)
+        for account in (17, 425):
+            with self.subTest(account=account):
+                selected = rf.local_config(steam, {'LastOwner': str(prefix | account)})
+                self.assertEqual(selected.parents[1].name, str(account))
+        self.assertEqual(rf.local_config(steam, {'LastOwner': 'invalid'}, '17').parents[1].name, '17')
+        with self.assertRaises(rf.SetupError):
+            rf.local_config(steam, {}, '999')
+
+    def test_local_config_falls_back_only_when_one_account_is_unambiguous(self):
+        steam = self.root/'Steam'
+        only = self.make_local_config(steam, 17)
+        for owner in (None, 'invalid', '0'):
+            with self.subTest(owner=owner):
+                self.assertEqual(rf.local_config(steam, {'LastOwner': owner}), only)
+        self.make_local_config(steam, 425)
+        with self.assertRaises(rf.SetupError):
+            rf.local_config(steam, {})
+
+    def test_install_check_and_launch_do_not_restrict_game_build(self):
+        steam, game, app, state, args = self.make_steam_fixture()
+        self.install_fixture(steam, game, app, state, args)
+        data = json.loads((state/'manifest.json').read_text())
+        self.assertEqual(data['user_id'], '425')
+        # Steam updates the build number while the supported files stay the same.
+        app['buildid'] = '2'
+        (steam/f'steamapps/appmanifest_{rf.APP_ID}.acf').write_text(rf.vdf_dump({'AppState': app}))
+        with patch.object(rf, 'game_running', return_value=False), patch('sys.stdout', new_callable=io.StringIO) as output:
+            self.assertEqual(rf.check(game, app, state), 0)
+        self.assertEqual(json.loads(output.getvalue())['build'], '2')
+        with patch.object(sys, 'argv', ['frame-resonite-launch', 'steam-command', '--argument']), patch.object(rf.os, 'execvpe') as execute:
+            rf.launch(state)
+        self.assertEqual(execute.call_args.args[:2], ('steam-command', ['steam-command', '--argument']))
+
+    def test_upgrade_from_previous_installer_replaces_helper_and_restores_originals(self):
+        steam, game, app, state, args = self.make_steam_fixture()
+        self.install_fixture(steam, game, app, state, args)
+        path = state/'manifest.json'
+        data = json.loads(path.read_text())
+        module = state/'lib/resonite_frame.py'
+        module.write_bytes(b'previous installer module')
+        next(entry for entry in data['files'] if entry['path'] == str(module))['after'] = rf.snapshot(module)
+        data.update(version='0.2.0', user_id=None)
+        path.write_text(json.dumps(data))
+        self.install_fixture(steam, game, app, state, args)
+        upgraded = json.loads(path.read_text())
+        self.assertEqual(upgraded['version'], rf.VERSION)
+        self.assertEqual(module.read_bytes(), Path(rf.__file__).read_bytes())
+        self.assertEqual(upgraded['user_id'], '425')
+        # The selected userdata remains identifiable without consulting LastOwner.
+        upgraded['app'] = {}
+        path.write_text(json.dumps(upgraded))
+        with patch.object(rf, 'game_running', return_value=False), patch.object(rf, 'steam_running', return_value=False), patch('sys.stdout', new_callable=io.StringIO):
+            rf.uninstall(state)
+        self.assertEqual((game/'LinuxBootstrap.sh').read_text(), BOOTSTRAP)
+        self.assertFalse(module.exists())
+        self.assertEqual(json.loads(path.read_text())['status'], 'uninstalled')
 
 if __name__ == '__main__':
     unittest.main()

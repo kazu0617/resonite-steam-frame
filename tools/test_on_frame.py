@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 import subprocess
 import sys
@@ -53,7 +54,7 @@ with tempfile.TemporaryDirectory(prefix="resonite-installer-integration-") as te
         path.write_bytes(data)
     if not args.fresh_runtime:
         shutil.copytree(game/"dotnet-runtime-arm64", fixture/"dotnet-runtime-arm64", copy_function=clone_file)
-    (steam/"steamapps/appmanifest_2519830.acf").write_text('"AppState" { "appid" "2519830" "installdir" "Resonite" "buildid" "26579448" "StateFlags" "4" "LastOwner" "76561197960265851" }\n')
+    (steam/"steamapps/appmanifest_2519830.acf").write_text('"AppState" { "appid" "2519830" "installdir" "Resonite" "buildid" "1" "StateFlags" "4" }\n')
     experimental = steam/"steamapps/common/Proton - Experimental"
     experimental.mkdir()
     # compatibilitytool.vdf is included only for testing the old v0.1.0 installer.
@@ -62,7 +63,9 @@ with tempfile.TemporaryDirectory(prefix="resonite-installer-integration-") as te
     config = steam/"config/config.vdf"
     config.parent.mkdir()
     config.write_text('"InstallConfigStore" { "Software" { "Valve" { "Steam" { "CompatToolMapping" { "2519830" { "name" "proton_11-arm64" "config" "old" "priority" "100" } } "other_setting" "keep me" } } } }\n')
-    local = steam/"userdata/123/config/localconfig.vdf"
+    # Generate a synthetic account directory for this isolated Steam tree.
+    account_id = str(secrets.randbelow(2**31 - 1) + 1)
+    local = steam/"userdata"/account_id/"config/localconfig.vdf"
     local.parent.mkdir(parents=True)
     local.write_text('"UserLocalConfigStore" { "Software" { "Valve" { "Steam" { "apps" { "2519830" { "LaunchOptions" "-Verbose" } "438100" { "setting" "before" } } } } } }\n')
     state = root/"state"
@@ -83,9 +86,14 @@ with tempfile.TemporaryDirectory(prefix="resonite-installer-integration-") as te
     command = ["bash", str(installer), "--steam-root", str(steam), "--bin-dir", str(binary), "--state-dir", str(state)]
     if args.previous_installer:
         prior = [command[0], str(args.previous_installer.resolve()), *command[2:]]
+        # Only legacy installers expose a build-allowlist override.
+        options = subprocess.run(prior[:2] + ["--help"], text=True, capture_output=True)
+        assert options.returncode == 0, options.stdout + options.stderr
+        if "--allow-untested-build" in options.stdout:
+            prior.append("--allow-untested-build")
         previous = subprocess.run(prior, text=True, capture_output=True)
         assert previous.returncode == 0, previous.stdout + previous.stderr
-        assert json.loads((state/"manifest.json").read_text())["version"] == "0.1.0"
+        assert json.loads((state/"manifest.json").read_text())["status"] == "installed"
     run = subprocess.run(command, text=True, capture_output=True)
     print(run.stdout, end="")
     if run.returncode:
@@ -105,9 +113,11 @@ with tempfile.TemporaryDirectory(prefix="resonite-installer-integration-") as te
         shutil.copy2(tool.with_name("yt-dlp_linux.backup"), tool)
     assert tool.read_bytes() == initial_tool
     version = subprocess.run([str(tool), "--version"], capture_output=True, text=True)
-    assert version.returncode == 0 and version.stdout.strip() == "2026.10.26", version.stdout + version.stderr
+    native_version = subprocess.run([str(fixture/"dotnet-runtime-arm64/tools/yt-dlp_linux_aarch64"), "--version"], capture_output=True, text=True)
+    assert native_version.returncode == 0 and native_version.stdout.strip(), native_version.stdout + native_version.stderr
+    assert version.returncode == 0 and version.stdout.strip() == native_version.stdout.strip(), version.stdout + version.stderr
     assert (fixture/"dotnet-runtime-arm64/tools/deno").is_file()
-    assert "--version 10.0.15" in (fixture/"LinuxBootstrap.sh").read_text()
+    assert f'--version {manifest["dotnet_version"]}' in (fixture/"LinuxBootstrap.sh").read_text()
     check = subprocess.run(command + ["--check"], text=True, capture_output=True)
     assert check.returncode == 0, check.stdout + check.stderr
     again = subprocess.run(command, text=True, capture_output=True)
