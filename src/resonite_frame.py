@@ -24,7 +24,7 @@ import urllib.request
 import zipfile
 from urllib.parse import urlparse
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 APP_ID = "2519830"
 MIKK_COMMIT = "a25b708d852d88848d4c729677cd8dbad4526523"
 MIKK_URL = f"https://api.github.com/repos/Yellow-Dog-Man/Mikktspace.NET/tarball/{MIKK_COMMIT}"
@@ -392,25 +392,85 @@ def local_config(steam, app, user_id=None):
     raise SetupError(tr('steam_account_ambiguous'))
 
 
+def live_account(steam):
+    name = cdp("loginStore.accountName")
+    if not isinstance(name, str) or not name:
+        raise SetupError(tr("steam_account_unavailable"))
+    users = subtree(vdf_load((steam/"config/loginusers.vdf").read_text()), "users")
+    matches = []
+    for steam_id, user in users.items():
+        account_name = next((v for k, v in user.items() if k.casefold() == "accountname"), None) if isinstance(user, dict) else None
+        if steam_id.isdecimal() and isinstance(account_name, str) and account_name.casefold() == name.casefold():
+            account_id = int(steam_id) & 0xFFFFFFFF
+            if account_id:
+                matches.append(str(account_id))
+    if len(matches) != 1:
+        raise SetupError(tr("steam_account_unavailable"))
+    return matches[0], name
+
+
+def manifest_account(data, steam, explicit=None):
+    """Recover legacy ownership from the recorded userdata path or unique wrapper."""
+    recorded = data.get("user_id")
+    if not recorded:
+        if data["settings_mode"] == "offline":
+            candidates = set()
+            for entry in data["files"]:
+                try:
+                    parts = Path(entry["path"]).relative_to(steam/"userdata").parts
+                except ValueError:
+                    continue
+                if entry.get("type") == "vdf" and len(parts) == 3 and parts[0].isdecimal() and parts[1:] == ("config", "localconfig.vdf"):
+                    candidates.add(parts[0])
+        else:
+            candidates = set()
+            expected = data["settings_after"]["launch"]
+            for path in steam.glob("userdata/*/config/localconfig.vdf"):
+                if not path.parents[1].name.isdecimal():
+                    continue
+                values = vdf_values(path, ("UserLocalConfigStore", "Software", "Valve", "Steam", "apps", APP_ID), ("LaunchOptions",))
+                if expected and values["LaunchOptions"] == expected:
+                    candidates.add(path.parents[1].name)
+        if len(candidates) == 1:
+            recorded = candidates.pop()
+        elif explicit:
+            recorded = explicit
+        else:
+            raise SetupError(tr("steam_account_legacy"))
+    if explicit and explicit != recorded:
+        raise SetupError(tr("steam_account_selection_conflict"))
+    return recorded
+
+
 class Settings:
     def __init__(self, steam, app, user_id=None):
         self.steam = steam
         self.config = steam/"config/config.vdf"
         self.local = None
         if steam_running(steam):
+            self.mode = "cdp"
             try:
-                self.before = live_settings()
-                self.mode = "cdp"
-                return
+                self.user_id, self.account_name = live_account(steam)
             except (OSError, ValueError, SetupError):
-                raise SetupError(tr('steam_live_unavailable'))
+                raise SetupError(tr("steam_account_unavailable"))
+            if user_id and self.user_id != user_id:
+                raise SetupError(tr("steam_account_mismatch"))
+            self.before = self.read()
+            return
         self.mode = "offline"
         self.local = local_config(steam, app, user_id)
+        self.user_id = self.local.parents[1].name
         self.before = self.read()
+
+    def require_account(self):
+        if self.mode == "cdp" and cdp("loginStore.accountName") != self.account_name:
+            raise SetupError(tr("steam_account_changed"))
 
     def read(self):
         if getattr(self, "mode", None) == "cdp":
+            self.require_account()
             result = live_settings()
+            self.require_account()
             if not isinstance(result, dict) or set(result) != {"launch", "compat"}:
                 raise SetupError(tr('steam_settings_unavailable'))
             return result
@@ -424,7 +484,8 @@ class Settings:
         if expected is not None and self.read() != expected:
             raise SetupError(tr('steam_settings_changed'))
         if self.mode == "cdp":
-            cdp("(async()=>{await SteamClient.Apps.SetAppLaunchOptions(2519830," + json.dumps(wanted["launch"]) + ");await SteamClient.Apps.SpecifyCompatTool(2519830," + json.dumps(wanted["compat"]) + ");return true})()")
+            guard = "if(loginStore.accountName!==" + json.dumps(self.account_name) + ")throw new Error('Steam account changed');"
+            cdp("(async()=>{" + guard + "await SteamClient.Apps.SetAppLaunchOptions(2519830," + json.dumps(wanted["launch"]) + ");" + guard + "await SteamClient.Apps.SpecifyCompatTool(2519830," + json.dumps(wanted["compat"]) + ");" + guard + "return true})()")
             for _ in range(20):
                 if self.read() == wanted:
                     return
@@ -451,9 +512,9 @@ class Settings:
 
 def launch_options(previous, helper):
     prefix = shlex.quote(str(helper))
+    if previous.startswith(prefix + " %command%"):
+        return previous if "-Device" in previous else previous + " -Device SteamVR"
     if str(helper) in previous:
-        if previous.startswith(prefix + " %command%"):
-            return previous if "-Device" in previous else previous + " -Device SteamVR"
         raise SetupError(tr('launch_options_unrecognized'))
     if "%command%" in previous:
         if previous.strip() != "%command%":
@@ -1017,7 +1078,7 @@ def launch(state_root):
         raise SystemExit(1)
 
 
-def check_report(game, app, state_root):
+def check_report(game, app, state_root, steam=None):
     requirement = runtime_requirement(game)
     runtime_version = local_runtime(game, requirement)
     result = {"game": str(game), "build": app.get("buildid"),
@@ -1030,6 +1091,30 @@ def check_report(game, app, state_root):
     result["video_tools_arm64"] = {name: (game/"dotnet-runtime-arm64/tools"/name).is_file() and elf_arm64(game/"dotnet-runtime-arm64/tools"/name) for name in ("yt-dlp_linux_aarch64", "deno")}
     result["video_launcher"] = (game/"RuntimeData/yt-dlp_linux").is_file() and (game/"RuntimeData/yt-dlp_linux").read_bytes() in [video_launcher(path.stem).encode() for path in LOCALES.glob("*.json")]
     result["compressonator_arm64"] = {name: (game/"runtimes/linux-arm64/native"/name).is_file() and elf_arm64(game/"runtimes/linux-arm64/native"/name) for name in CMP_LIBS}
+    result.update(installation_complete=False, managed_files=False, steam_settings_match=False, changed_files=[])
+    if result["installer_manifest"]:
+        try:
+            data = json.loads((state_root/"manifest.json").read_text())
+            recorded_steam = Path(data["steam"])
+            # For direct callers, verify the recorded Steam library owns this game.
+            selected_steam = steam if steam is not None else recorded_steam
+            found_game, _ = find_game(selected_steam, str(game))
+            result["installation_complete"] = data["status"] == "installed" and Path(data["game"]).resolve() == found_game == game.resolve() and recorded_steam.resolve() == selected_steam.resolve()
+            if result["installation_complete"]:
+                live = steam_running(selected_steam)
+                result["changed_files"] = [e["path"] for e in data["files"] if not (live and e.get("type") == "vdf") and entry_value(e) != e["after"]]
+                result["managed_files"] = not result["changed_files"]
+                # Older managed launchers use the same ARM64 dispatch with
+                # different display messages. Their journal verifies the bytes.
+                video_path = game/"RuntimeData/yt-dlp_linux"
+                entry = next((e for e in data["files"] if e["path"] == str(video_path) and e.get("type") != "vdf"), None)
+                if entry and entry_value(entry) == entry["after"] and b'exec "$tools/yt-dlp_linux_aarch64" "$@"' in video_path.read_bytes():
+                    result["video_launcher"] = True
+                account = manifest_account(data, selected_steam)
+                settings = Settings(selected_steam, data["app"], account)
+                result["steam_settings_match"] = settings.read() == data["settings_after"]
+        except (OSError, ValueError, KeyError, SetupError) as error:
+            result["installation_error"] = str(error)
     try:
         text = (game/"LinuxBootstrap.sh").read_text()
         pinned = re.search(r'--verbose --version ([0-9A-Za-z.-]+) --runtime dotnet --architecture arm64', text)
@@ -1038,17 +1123,17 @@ def check_report(game, app, state_root):
         result["bootstrap_supported"] = patched == text and runtime_matches(version, requirement) and local_runtime(game, {"version": version, "exact": True}) is not None
     except SetupError:
         result["bootstrap_supported"] = False
-    ready = result["runtime_arm64"] and result["runtime_version_available"] and all(result["support_libraries"].values()) and result["mikktspace_arm64"] and result["bootstrap_supported"] and result["video_launcher"] and all(result["video_tools_arm64"].values()) and all(result["compressonator_arm64"].values())
+    ready = result["installation_complete"] and result["managed_files"] and result["steam_settings_match"] and result["runtime_arm64"] and result["runtime_version_available"] and all(result["support_libraries"].values()) and result["mikktspace_arm64"] and result["bootstrap_supported"] and result["video_launcher"] and all(result["video_tools_arm64"].values()) and all(result["compressonator_arm64"].values())
     return result, 0 if ready else 1
 
 
-def check(game, app, state_root):
-    result, code = check_report(game, app, state_root)
+def check(game, app, state_root, steam=None):
+    result, code = check_report(game, app, state_root, steam)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return code
 
 
-def uninstall(state_root):
+def uninstall(state_root, user_id=None):
     path = state_root/"manifest.json"
     data = json.loads(path.read_text())
     if data["status"] == "uninstalled":
@@ -1057,19 +1142,25 @@ def uninstall(state_root):
     game, steam = Path(data["game"]), Path(data["steam"])
     if game_running(game):
         raise SetupError(tr('uninstall_game_running'))
-    settings = Settings(steam, data["app"], data.get("user_id"))
+    account = manifest_account(data, steam, user_id)
+    settings = Settings(steam, data["app"], account)
     if data["settings_mode"] == "cdp":
         if settings.mode != "cdp":
             raise SetupError(tr('restore_steam_open_required'))
         current = settings.read()
         if any(current[k] not in (data["settings_after"][k], data["settings_before"][k]) for k in current):
             raise SetupError(tr('restore_launch_options_changed'))
-        # Validate files before changing even the live settings.
-        validate_restore(data)
-        if current != data["settings_before"]:
-            settings.apply(data["settings_before"], expected=current)
     elif settings.mode != "offline":
         raise SetupError(tr('restore_steam_closed_required'))
+    # Resolve and persist legacy ownership before changing settings, so a retry
+    # still identifies the original account after its launch options are restored.
+    validate_restore(data)
+    if data.get("user_id") != account:
+        data["user_id"] = account
+        atomic(path, (json.dumps(data, ensure_ascii=False, indent=2)+"\n").encode(), 0o600)
+    if settings.mode == "cdp" and current != data["settings_before"]:
+        settings.apply(data["settings_before"], expected=current)
+    settings.require_account()
     restore_files(data)
     data["status"] = "uninstalled"
     atomic(path, (json.dumps(data, ensure_ascii=False, indent=2)+"\n").encode(), 0o600)
@@ -1091,13 +1182,16 @@ def install(args, steam, game, app, state_root):
     script = game/"LinuxBootstrap.sh"
     original = script.read_bytes()
     patch_bootstrap(original.decode(), requirement["version"])  # Validate before staging.
-    settings = Settings(steam, app, args.user_id)
+    manifest = state_root/"manifest.json"
+    data = json.loads(manifest.read_text()) if manifest.is_file() else None
+    user_id = args.user_id
+    if data and data["status"] != "uninstalled" and data["game"] == str(game):
+        user_id = manifest_account(data, steam, user_id)
+    settings = Settings(steam, app, user_id)
     helper = (Path(args.bin_dir).expanduser().absolute() if args.bin_dir else Path.home()/".local/bin")/"frame-resonite-launch"
     wanted = {"launch": launch_options(settings.before["launch"], helper), "compat": "proton_experimental"}
-    manifest = state_root/"manifest.json"
     previous = None
-    if manifest.is_file():
-        data = json.loads(manifest.read_text())
+    if data:
         if data["status"] == "installed" and data["game"] == str(game):
             changed = [e for e in data["files"] if entry_value(e) != e["after"]]
             # Steam may replace the bootstrap during a game update. A recognized
@@ -1146,7 +1240,7 @@ def install(args, steam, game, app, state_root):
         _, latest_app = find_game(steam, str(game))
         if game_running(game) or script.read_bytes() != original or (game/"Renderite.Host.runtimeconfig.json").read_bytes() != runtime_config_before or settings.read() != settings.before or latest_app.get("buildid") != app.get("buildid") or latest_app.get("StateFlags") != "4":
             raise SetupError(tr('install_staging_race'))
-        tx = Transaction(state_root, {"game": str(game), "steam": str(steam), "build": app.get("buildid"), "app": {"LastOwner": app.get("LastOwner", "0")}, "user_id": settings.local.parents[1].name if settings.local else args.user_id,
+        tx = Transaction(state_root, {"game": str(game), "steam": str(steam), "build": app.get("buildid"), "app": {"LastOwner": app.get("LastOwner", "0")}, "user_id": settings.user_id,
                   "settings_mode": settings.mode, "settings_before": previous["settings_before"] if previous else settings.before, "settings_after": wanted, "required": [], "source_commit": MIKK_COMMIT, "source_sha256": MIKK_SHA256, "dotnet_version": runtime_version, "dotnet_required": requirement["version"],
                   "compressonator_commit": CMP_COMMIT, "yt_dlp_version": YTDLP_VERSION, "deno_version": DENO_VERSION}, previous=previous)
         try:
@@ -1219,11 +1313,15 @@ def show_check(result, code):
         return tr("check_ok") if value else tr("check_missing")
     lines = [tr("check_ready") if code == 0 else tr("check_incomplete"), "",
         tr("check_runtime", required=result["runtime_required"], installed=result["runtime_version"] or tr("check_none"))]
-    for key in ("runtime_arm64", "bootstrap_supported", "mikktspace_arm64", "video_launcher"):
+    for key in ("installation_complete", "managed_files", "steam_settings_match", "runtime_arm64", "bootstrap_supported", "mikktspace_arm64", "video_launcher"):
         lines.append(tr("check_item", name=tr("check_" + key), status=status(result[key])))
     for key in ("support_libraries", "video_tools_arm64", "compressonator_arm64"):
         lines.append(tr("check_item", name=tr("check_" + key), status=status(all(result[key].values()))))
         lines.extend("  " + name for name, exists in result[key].items() if not exists)
+    if result["changed_files"]:
+        lines += ["", tr("check_changed_files"), *result["changed_files"]]
+    if result.get("installation_error"):
+        lines += ["", result["installation_error"]]
     subprocess.run(["whiptail", "--title", tr("menu_check"), "--ok-button", tr("menu_close"), "--scrolltext", "--msgbox", "\n".join(lines), "22", "78"], stdout=sys.stderr, check=True)
 
 
@@ -1260,16 +1358,16 @@ def main(argv=None):
             if not (state_root/"manifest.json").is_file():
                 raise SetupError(tr('manifest_missing'))
             with locked_state(state_root):
-                uninstall(state_root)
+                uninstall(state_root, args.user_id)
             return 0
         steam = steam_root(args.steam_root)
         game, app = find_game(steam, args.game_dir)
         if action == "check":
             if interactive:
-                result, code = check_report(game, app, state_root)
+                result, code = check_report(game, app, state_root, steam)
                 show_check(result, code)
                 return code
-            return check(game, app, state_root)
+            return check(game, app, state_root, steam)
         with locked_state(state_root):
             install(args, steam, game, app, state_root)
         return 0

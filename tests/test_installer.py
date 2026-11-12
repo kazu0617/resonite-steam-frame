@@ -122,10 +122,10 @@ class InstallerTests(unittest.TestCase):
                 rf.unpack(archive, self.root/'extracted', strip=1)
 
     def test_keeps_existing_game_arguments_and_refuses_custom_wrapper(self):
-        helper = Path('/home/test/.local/bin/frame-resonite-launch')
-        wanted = rf.launch_options('-Screen -Verbose', helper)
-        self.assertIn('%command% -Screen -Verbose', wanted)
-        self.assertEqual(rf.launch_options(wanted, helper), wanted)
+        for helper in (Path('/home/test/.local/bin/frame-resonite-launch'), Path("/tmp/test user's bin/frame-resonite-launch")):
+            wanted = rf.launch_options('-Screen -Verbose', helper)
+            self.assertIn('%command% -Screen -Verbose', wanted)
+            self.assertEqual(rf.launch_options(wanted, helper), wanted)
         with self.assertRaises(rf.SetupError):
             rf.launch_options('other-wrapper %command% -Verbose', helper)
 
@@ -522,6 +522,152 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(result['runtime_version'], '11.0.8')
         download.assert_not_called()
+
+    def make_live_record(self, user_id='425'):
+        steam = self.root/'Steam'
+        game = steam/'steamapps/common/Resonite'
+        game.mkdir(parents=True)
+        state = self.root/'state'
+        helper = self.root/'helper'
+        after = {'launch': 'fixture-helper %command% -Device SteamVR', 'compat': 'proton_experimental'}
+        before = {'launch': '', 'compat': 'original'}
+        tx = rf.Transaction(state, {'game': str(game), 'steam': str(steam), 'app': {}, 'user_id': user_id,
+            'settings_mode': 'cdp', 'settings_before': before, 'settings_after': after})
+        tx.put(helper, b'installed helper', 0o755)
+        tx.data['status'] = 'installed'
+        tx.save()
+        return steam, game, state, helper, before, after
+
+    def test_live_account_matches_login_name_to_userdata_without_last_owner(self):
+        steam = self.root/'Steam'
+        path = steam/'config/loginusers.vdf'
+        path.parent.mkdir(parents=True)
+        prefix = (1 << 56) | (1 << 52) | (1 << 32)
+        users = {str(prefix | 17): {'AccountName': 'alpha'}, str(prefix | 425): {'AccountName': 'bravo'}}
+        path.write_text(rf.vdf_dump({'users': users}))
+        with patch.object(rf, 'cdp', return_value='BRAVO'):
+            self.assertEqual(rf.live_account(steam), ('425', 'BRAVO'))
+        users[str(prefix | 426)] = {'AccountName': 'bravo'}
+        path.write_text(rf.vdf_dump({'users': users}))
+        with patch.object(rf, 'cdp', return_value='bravo'), self.assertRaises(rf.SetupError):
+            rf.live_account(steam)
+        with patch.object(rf, 'cdp', return_value='unknown'), self.assertRaises(rf.SetupError):
+            rf.live_account(steam)
+
+    def test_uninstall_rejects_other_live_account_before_any_mutation(self):
+        steam, game, state, helper, before, after = self.make_live_record()
+        saved = (state/'manifest.json').read_bytes()
+        with patch.object(rf, 'game_running', return_value=False), patch.object(rf, 'steam_running', return_value=True), \
+             patch.object(rf, 'live_account', return_value=('17', 'other')), patch.object(rf, 'live_settings', return_value=before), \
+             patch.object(rf, 'cdp') as cdp, self.assertRaises(rf.SetupError):
+            rf.uninstall(state)
+        self.assertEqual(helper.read_bytes(), b'installed helper')
+        self.assertEqual((state/'manifest.json').read_bytes(), saved)
+        cdp.assert_not_called()
+        # An explicit selection cannot override the account in a known journal.
+        with self.assertRaises(rf.SetupError):
+            rf.manifest_account(json.loads(saved), steam, '17')
+
+    def test_legacy_account_inference_is_unique_and_does_not_use_active_account(self):
+        steam, game, state, helper, before, after = self.make_live_record(user_id=None)
+        data = json.loads((state/'manifest.json').read_text())
+        with self.assertRaises(rf.SetupError):
+            rf.manifest_account(data, steam)
+        self.assertEqual(rf.manifest_account(data, steam, '425'), '425')
+        local = self.make_local_config(steam, 425)
+        local.write_bytes(rf.vdf_edit(local.read_bytes(), ('UserLocalConfigStore', 'Software', 'Valve', 'Steam', 'apps', rf.APP_ID), {'LaunchOptions': after['launch']}))
+        self.assertEqual(rf.manifest_account(data, steam), '425')
+        with patch.object(rf, 'game_running', return_value=False), patch.object(rf, 'steam_running', return_value=True), \
+             patch.object(rf, 'live_account', return_value=('17', 'other')), self.assertRaises(rf.SetupError):
+            rf.uninstall(state)
+        self.assertTrue(helper.exists())
+        other = self.make_local_config(steam, 17)
+        other.write_bytes(rf.vdf_edit(other.read_bytes(), ('UserLocalConfigStore', 'Software', 'Valve', 'Steam', 'apps', rf.APP_ID), {'LaunchOptions': after['launch']}))
+        with self.assertRaises(rf.SetupError):
+            rf.manifest_account(data, steam)
+
+    def test_legacy_restore_records_account_before_interrupted_setting_restore(self):
+        steam, game, state, helper, before, after = self.make_live_record(user_id=None)
+        local = self.make_local_config(steam, 425)
+        local.write_bytes(rf.vdf_edit(local.read_bytes(), ('UserLocalConfigStore', 'Software', 'Valve', 'Steam', 'apps', rf.APP_ID), {'LaunchOptions': after['launch']}))
+        with patch.object(rf, 'game_running', return_value=False), patch.object(rf, 'steam_running', return_value=True), \
+             patch.object(rf, 'live_account', return_value=('425', 'original')), patch.object(rf, 'live_settings', return_value=after), \
+             patch.object(rf, 'cdp', return_value='original'), patch.object(rf.Settings, 'apply', side_effect=rf.SetupError('interrupted')):
+            with self.assertRaises(rf.SetupError):
+                rf.uninstall(state)
+        self.assertEqual(json.loads((state/'manifest.json').read_text())['user_id'], '425')
+        self.assertTrue(helper.exists())
+        # On retry, the settings have already been restored and no longer identify
+        # their owner. The saved account still permits safe completion.
+        with patch.object(rf, 'game_running', return_value=False), patch.object(rf, 'steam_running', return_value=True), \
+             patch.object(rf, 'live_account', return_value=('425', 'original')), patch.object(rf, 'live_settings', return_value=before), \
+             patch.object(rf, 'cdp', return_value='original'):
+            rf.uninstall(state)
+        self.assertFalse(helper.exists())
+        self.assertEqual(json.loads((state/'manifest.json').read_text())['status'], 'uninstalled')
+
+    def test_settings_detect_account_switch_during_read(self):
+        with patch.object(rf, 'steam_running', return_value=True), patch.object(rf, 'live_account', return_value=('425', 'original')), \
+             patch.object(rf, 'live_settings', return_value={'launch': '', 'compat': ''}), \
+             patch.object(rf, 'cdp', side_effect=['original', 'other']), self.assertRaises(rf.SetupError):
+            rf.Settings(self.root, {}, '425')
+
+    def test_reinstall_uses_recorded_userdata_even_when_last_owner_changes(self):
+        steam, game, app, state, args = self.make_steam_fixture()
+        self.install_fixture(steam, game, app, state, args)
+        app['LastOwner'] = str((1 << 56) | (1 << 52) | (1 << 32) | 17)
+        (steam/f'steamapps/appmanifest_{rf.APP_ID}.acf').write_text(rf.vdf_dump({'AppState': app}))
+        self.install_fixture(steam, game, app, state, args)
+        self.assertEqual(json.loads((state/'manifest.json').read_text())['user_id'], '425')
+
+    def test_check_rejects_missing_helper_or_failed_manifest_without_writing(self):
+        steam, game, app, state, args = self.make_steam_fixture()
+        self.install_fixture(steam, game, app, state, args)
+        helper = Path(args.bin_dir)/'frame-resonite-launch'
+        helper.unlink()
+        before = (state/'manifest.json').read_bytes()
+        with patch.object(rf, 'steam_running', return_value=False):
+            report, code = rf.check_report(game, app, state, steam)
+        self.assertEqual(code, 1)
+        self.assertFalse(report['managed_files'])
+        self.assertIn(str(helper), report['changed_files'])
+        self.assertEqual((state/'manifest.json').read_bytes(), before)
+        data = json.loads(before)
+        data['status'] = 'failed'
+        (state/'manifest.json').write_text(json.dumps(data))
+        with patch.object(rf, 'steam_running', return_value=False):
+            report, code = rf.check_report(game, app, state, steam)
+        self.assertEqual(code, 1)
+        self.assertFalse(report['installation_complete'])
+
+    def test_check_rejects_changed_launch_settings_and_other_steam_root(self):
+        steam, game, app, state, args = self.make_steam_fixture()
+        self.install_fixture(steam, game, app, state, args)
+        local = steam/'userdata/425/config/localconfig.vdf'
+        local.write_bytes(rf.vdf_edit(local.read_bytes(), ('UserLocalConfigStore', 'Software', 'Valve', 'Steam', 'apps', rf.APP_ID), {'LaunchOptions': '-changed'}))
+        with patch.object(rf, 'steam_running', return_value=False):
+            report, code = rf.check_report(game, app, state, steam)
+        self.assertEqual(code, 1)
+        self.assertFalse(report['steam_settings_match'])
+        other = self.root/'other Steam'
+        other.mkdir()
+        with patch.object(rf, 'steam_running', return_value=False):
+            report, code = rf.check_report(game, app, state, other)
+        self.assertEqual(code, 1)
+        self.assertFalse(report['installation_complete'])
+
+    def test_check_uses_live_settings_when_disk_vdf_is_not_saved_yet(self):
+        steam, game, app, state, args = self.make_steam_fixture()
+        self.install_fixture(steam, game, app, state, args)
+        data = json.loads((state/'manifest.json').read_text())
+        local = steam/'userdata/425/config/localconfig.vdf'
+        local.write_bytes(rf.vdf_edit(local.read_bytes(), ('UserLocalConfigStore', 'Software', 'Valve', 'Steam', 'apps', rf.APP_ID), {'LaunchOptions': '-not-flushed'}))
+        with patch.object(rf, 'steam_running', return_value=True), patch.object(rf, 'live_account', return_value=('425', 'original')), \
+             patch.object(rf, 'live_settings', return_value=data['settings_after']), patch.object(rf, 'cdp', return_value='original'):
+            report, code = rf.check_report(game, app, state, steam)
+        self.assertEqual(code, 0)
+        self.assertTrue(report['managed_files'])
+        self.assertTrue(report['steam_settings_match'])
 
 if __name__ == '__main__':
     unittest.main()

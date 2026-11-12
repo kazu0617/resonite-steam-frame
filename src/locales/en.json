@@ -117,7 +117,7 @@
   "check_missing": "Needs attention",
   "check_none": "Not installed",
   "check_ready": "The required startup files are present.",
-  "check_incomplete": "Some required items are missing. Update the setup using the installer.",
+  "check_incomplete": "Some items need attention. Review the results before updating or restoring.",
   "check_runtime": ".NET: required {required} / installed {installed}",
   "check_item": "{name}: {status}",
   "check_runtime_arm64": "ARM64 .NET runtime",
@@ -130,5 +130,14 @@
   "video_update_required": "Run the Resonite Frame installer to update yt-dlp.",
   "video_update_managed": "yt-dlp is managed by the Resonite Frame installer.",
   "menu_select": "Select",
-  "menu_close": "Close"
+  "menu_close": "Close",
+  "steam_account_unavailable": "Could not identify the signed-in Steam account. Sign in to Steam again, then retry.",
+  "steam_account_mismatch": "The signed-in Steam account differs from the installation account. Switch to the account used for installation, then retry.",
+  "steam_account_changed": "The Steam account changed during the operation. Switch back to the account you started with, then retry.",
+  "steam_account_legacy": "The old installation record does not identify its Steam account. Retry with --user-id set to the account number used for installation.",
+  "steam_account_selection_conflict": "The --user-id value does not match the installation record. Use the account number from the original installation.",
+  "check_installation_complete": "Installation record",
+  "check_managed_files": "Installed file integrity",
+  "check_steam_settings_match": "Steam launch settings",
+  "check_changed_files": "Files changed since installation:"
 }

@@ -117,7 +117,7 @@
   "check_missing": "要確認",
   "check_none": "未導入",
   "check_ready": "起動に必要なファイルがそろっています。",
-  "check_incomplete": "不足している項目があります。インストーラーで更新してください。",
+  "check_incomplete": "確認が必要な項目があります。結果を確認してから更新・復元してください。",
   "check_runtime": ".NET: 要求 {required} / 導入済み {installed}",
   "check_item": "{name}: {status}",
   "check_runtime_arm64": ".NETのARM64対応",
@@ -130,5 +130,14 @@
   "video_update_required": "yt-dlpの更新にはResonite Frameインストーラーを実行してください。",
   "video_update_managed": "yt-dlpはResonite Frameインストーラーで更新します。",
   "menu_select": "選択",
-  "menu_close": "閉じる"
+  "menu_close": "閉じる",
+  "steam_account_unavailable": "ログイン中のSteamアカウントを特定できません。Steamにログインし直してから再実行してください。",
+  "steam_account_mismatch": "Steamのログインアカウントが導入対象と異なります。導入に使ったアカウントに切り替えてから再実行してください。",
+  "steam_account_changed": "処理中にSteamアカウントが切り替わりました。実行を始めたときのアカウントに戻してから再実行してください。",
+  "steam_account_legacy": "以前の導入記録からSteamアカウントを特定できません。導入時のアカウント番号を --user-id に指定して再実行してください。",
+  "steam_account_selection_conflict": "--user-id の指定が導入記録と一致しません。導入時のアカウント番号を指定してください。",
+  "check_installation_complete": "導入記録",
+  "check_managed_files": "導入ファイルの整合性",
+  "check_steam_settings_match": "Steamの起動設定",
+  "check_changed_files": "導入後に変わったファイル:"
 }
