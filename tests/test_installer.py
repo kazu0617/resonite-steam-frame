@@ -20,6 +20,7 @@ BOOTSTRAP = '''#!/bin/sh
 DOTNET_ROOT="$PWD/dotnet-runtime"
 dotnet() { "$DOTNET_EXECUTABLE" "$@"; }
 bash "$DOTNET_INSTALL_SCRIPT" --verbose --channel 10.0 --runtime dotnet --install-dir "$DOTNET_ROOT"
+dotnet Renderite.Host.dll "$@"
 '''
 
 
@@ -37,12 +38,15 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(rf.patch_bootstrap(modified, FIXTURE_RUNTIME), modified)
         self.assertIn(f'--version {FIXTURE_RUNTIME}', modified)
         self.assertIn('OPENSSL_MODULES=', modified)
+        self.assertIn('dotnet exec --runtimeconfig "$PWD/Renderite.Host.frame.runtimeconfig.json" Renderite.Host.dll "$@"', modified)
         manual = BOOTSTRAP.replace('dotnet-runtime"', 'dotnet-runtime-arm64"').replace('--runtime dotnet --install-dir', '--runtime dotnet --architecture arm64 --install-dir')
         self.assertEqual(rf.patch_bootstrap(manual, FIXTURE_RUNTIME), modified)
 
     def test_changed_bootstrap_fails_without_guessing(self):
         with self.assertRaises(rf.SetupError):
             rf.patch_bootstrap(BOOTSTRAP.replace('--runtime dotnet', '--runtime unknown'), FIXTURE_RUNTIME)
+        with self.assertRaises(rf.SetupError):
+            rf.patch_bootstrap(BOOTSTRAP.replace('Renderite.Host.dll', 'unknown.dll'), FIXTURE_RUNTIME)
 
     def test_vdf_roundtrip_quotes_backslashes_and_unicode(self):
         original = {'root': {'path': 'C:\\ゲーム\\models', 'quote': '"hello"', 'newline': 'a\nb', 'unknown': '\\q'}}
@@ -398,9 +402,61 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(requirement('11.0.0-rc.2')['exact'])
         with self.assertRaises(rf.SetupError):
             requirement(rollForward='unknown')
-        path.write_text(json.dumps({'runtimeOptions': {'frameworks': [{'name': 'Microsoft.NETCore.App', 'version': '11.0.0'}, {'name': 'Microsoft.WindowsDesktop.App', 'version': '11.0.0'}]}}))
-        with self.assertRaises(rf.SetupError):
-            rf.runtime_requirement(game)
+
+    def test_windows_desktop_configuration_is_normalized_without_changing_original(self):
+        game = self.root/'game'
+        game.mkdir()
+        path = game/'Renderite.Host.runtimeconfig.json'
+        for version in ('10.0.0', '11.0.0', '12.0.2'):
+            with self.subTest(version=version):
+                core = {'name': 'Microsoft.NETCore.App', 'version': version, 'rollForward': 'Disable'}
+                desktop = {'name': 'Microsoft.WindowsDesktop.App', 'version': version}
+                config = {'runtimeOptions': {'tfm': 'net' + '.'.join(version.split('.')[:2]), 'frameworks': [desktop, core], 'configProperties': {'keep': False}}, 'keep': ['unknown setting']}
+                original = json.dumps(config).encode()
+                path.write_bytes(original)
+                native = json.loads(rf.linux_runtime_config(game))
+                self.assertEqual(native['runtimeOptions']['frameworks'], [core])
+                self.assertEqual(native['runtimeOptions']['configProperties'], {'keep': False})
+                self.assertEqual(native['keep'], config['keep'])
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(rf.runtime_requirement(game), {'version': version, 'exact': True})
+
+    def test_unknown_or_duplicate_frameworks_remain_unsupported(self):
+        game = self.root/'game'
+        game.mkdir()
+        core = {'name': 'Microsoft.NETCore.App', 'version': '11.0.0'}
+        desktop = {'name': 'Microsoft.WindowsDesktop.App', 'version': '11.0.0'}
+        for frameworks in ([], [desktop], [core, core], [core, desktop, desktop], [core, {'name': 'Microsoft.AspNetCore.App', 'version': '11.0.0'}], [core, None], 'invalid'):
+            with self.subTest(frameworks=frameworks):
+                (game/'Renderite.Host.runtimeconfig.json').write_text(json.dumps({'runtimeOptions': {'frameworks': frameworks}}))
+                with self.assertRaises(rf.SetupError):
+                    rf.runtime_requirement(game)
+
+    def test_native_config_is_managed_and_stale_config_blocks_check_and_launch(self):
+        steam, game, app, state, args = self.make_steam_fixture()
+        config = game/'Renderite.Host.runtimeconfig.json'
+        original = config.read_bytes()
+        self.install_fixture(steam, game, app, state, args)
+        native = game/rf.NATIVE_RUNTIME_CONFIG
+        self.assertEqual(config.read_bytes(), original)
+        self.assertEqual(native.read_bytes(), rf.linux_runtime_config(game))
+        changed = json.loads(original)
+        changed['runtimeOptions']['configProperties'] = {'new_game_option': True}
+        config.write_text(json.dumps(changed))
+        with patch.object(rf, 'game_running', return_value=False), patch.object(rf, 'steam_running', return_value=False):
+            report, code = rf.check_report(game, app, state, steam)
+        self.assertEqual(code, 1)
+        self.assertFalse(report['runtime_configuration'])
+        with patch.object(sys, 'argv', ['frame-resonite-launch', 'steam-command']), patch.object(rf.os, 'execvpe') as execute, patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                rf.launch(state)
+        execute.assert_not_called()
+        self.install_fixture(steam, game, app, state, args)
+        self.assertEqual(native.read_bytes(), rf.linux_runtime_config(game))
+        with patch.object(rf, 'game_running', return_value=False), patch.object(rf, 'steam_running', return_value=False), patch('sys.stdout', new_callable=io.StringIO):
+            rf.uninstall(state)
+        self.assertFalse(native.exists())
+        self.assertEqual(json.loads(config.read_bytes()), changed)
 
     def test_bootstrap_accepts_future_channel_and_changes_pinned_runtime(self):
         for channel in ('11.0', '12.0'):

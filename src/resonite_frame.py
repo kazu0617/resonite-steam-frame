@@ -24,8 +24,9 @@ import urllib.request
 import zipfile
 from urllib.parse import urlparse
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 APP_ID = "2519830"
+NATIVE_RUNTIME_CONFIG = "Renderite.Host.frame.runtimeconfig.json"
 MIKK_COMMIT = "a25b708d852d88848d4c729677cd8dbad4526523"
 MIKK_URL = f"https://api.github.com/repos/Yellow-Dog-Man/Mikktspace.NET/tarball/{MIKK_COMMIT}"
 MIKK_SHA256 = "987e5056e13468ca2375ce8400329af36ec0dc22090f15e42c31f9c74599d250"
@@ -542,11 +543,18 @@ def patch_bootstrap(original, runtime_version):
     prefix = ('OPENSSL_MODULES="$PWD/frame-libs-arm64/ossl-modules" '
               'OPENSSL_CONF="$PWD/frame-libs-arm64/openssl.cnf" '
               'LD_LIBRARY_PATH="$PWD/frame-libs-arm64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ')
-    if original.count(prefix + command) == 1:
-        return original
     if original.count(command) != 1:
         raise SetupError(tr('bootstrap_dotnet_missing'))
-    return original.replace(command, prefix + command, 1)
+    if original.count(prefix + command) != 1:
+        original = original.replace(command, prefix + command, 1)
+    # Keep Steam's Windows runtime configuration intact. The native engine uses
+    # a separate configuration with only the framework available on Linux.
+    launch = (r'(?m)^(?P<indent>[ \t]*)dotnet '
+              r'(?:exec --runtimeconfig "\$PWD/Renderite\.Host\.frame\.runtimeconfig\.json" )?'
+              r'Renderite\.Host\.dll "\$@"[ \t]*$')
+    if len(list(re.finditer(launch, original))) != 1:
+        raise SetupError(tr('bootstrap_dotnet_missing'))
+    return re.sub(launch, lambda m: m['indent'] + f'dotnet exec --runtimeconfig "$PWD/{NATIVE_RUNTIME_CONFIG}" Renderite.Host.dll "$@"', original)
 
 
 def snapshot(path):
@@ -729,11 +737,25 @@ def version_key(version):
     return tuple(int(match[n]) for n in (1, 2, 3)) + (1 if match[4] is None else 0, pre)
 
 
-def runtime_requirement(game):
-    options = json.loads((game/"Renderite.Host.runtimeconfig.json").read_text())["runtimeOptions"]
-    frameworks = options.get("frameworks", []) + ([options["framework"]] if "framework" in options else [])
-    if len(frameworks) != 1 or frameworks[0].get("name") != "Microsoft.NETCore.App":
+def linux_runtime_config(game):
+    configuration = json.loads((game/"Renderite.Host.runtimeconfig.json").read_text())
+    options = configuration["runtimeOptions"]
+    if "framework" in options and "frameworks" in options:
         raise SetupError(tr('runtime_framework_unsupported'))
+    frameworks = options.get("frameworks", [options.get("framework")])
+    if not isinstance(frameworks, list) or not all(isinstance(f, dict) for f in frameworks):
+        raise SetupError(tr('runtime_framework_unsupported'))
+    names = [f.get("name") for f in frameworks]
+    if names.count("Microsoft.NETCore.App") != 1 or names.count("Microsoft.WindowsDesktop.App") > 1 or any(name not in ("Microsoft.NETCore.App", "Microsoft.WindowsDesktop.App") for name in names):
+        raise SetupError(tr('runtime_framework_unsupported'))
+    if "frameworks" in options:
+        options["frameworks"] = [f for f in frameworks if f["name"] == "Microsoft.NETCore.App"]
+    return (json.dumps(configuration, ensure_ascii=False, indent=2) + "\n").encode()
+
+
+def runtime_requirement(game):
+    options = json.loads(linux_runtime_config(game))["runtimeOptions"]
+    frameworks = options.get("frameworks", [options.get("framework")])
     framework = frameworks[0]
     version = framework["version"]
     version_key(version)
@@ -1064,6 +1086,8 @@ def launch(state_root):
         script = game/"LinuxBootstrap.sh"
         text = script.read_text()
         requirement = runtime_requirement(game)
+        if (game/NATIVE_RUNTIME_CONFIG).read_bytes() != linux_runtime_config(game):
+            raise SetupError(tr('launch_bootstrap_changed'))
         if not local_runtime(game, requirement):
             raise SetupError(tr("runtime_reinstall", version=requirement["version"]))
         patched = patch_bootstrap(text, state["dotnet_version"])
@@ -1092,6 +1116,7 @@ def check_report(game, app, state_root, steam=None):
     result["video_launcher"] = (game/"RuntimeData/yt-dlp_linux").is_file() and (game/"RuntimeData/yt-dlp_linux").read_bytes() in [video_launcher(path.stem).encode() for path in LOCALES.glob("*.json")]
     result["compressonator_arm64"] = {name: (game/"runtimes/linux-arm64/native"/name).is_file() and elf_arm64(game/"runtimes/linux-arm64/native"/name) for name in CMP_LIBS}
     result.update(installation_complete=False, managed_files=False, steam_settings_match=False, changed_files=[])
+    result["runtime_configuration"] = (game/NATIVE_RUNTIME_CONFIG).is_file() and (game/NATIVE_RUNTIME_CONFIG).read_bytes() == linux_runtime_config(game)
     if result["installer_manifest"]:
         try:
             data = json.loads((state_root/"manifest.json").read_text())
@@ -1123,7 +1148,7 @@ def check_report(game, app, state_root, steam=None):
         result["bootstrap_supported"] = patched == text and runtime_matches(version, requirement) and local_runtime(game, {"version": version, "exact": True}) is not None
     except SetupError:
         result["bootstrap_supported"] = False
-    ready = result["installation_complete"] and result["managed_files"] and result["steam_settings_match"] and result["runtime_arm64"] and result["runtime_version_available"] and all(result["support_libraries"].values()) and result["mikktspace_arm64"] and result["bootstrap_supported"] and result["video_launcher"] and all(result["video_tools_arm64"].values()) and all(result["compressonator_arm64"].values())
+    ready = result["installation_complete"] and result["managed_files"] and result["steam_settings_match"] and result["runtime_arm64"] and result["runtime_version_available"] and result["runtime_configuration"] and all(result["support_libraries"].values()) and result["mikktspace_arm64"] and result["bootstrap_supported"] and result["video_launcher"] and all(result["video_tools_arm64"].values()) and all(result["compressonator_arm64"].values())
     return result, 0 if ready else 1
 
 
@@ -1174,6 +1199,7 @@ def install(args, steam, game, app, state_root):
         raise SetupError(tr('game_updating'))
     requirement = runtime_requirement(game)
     runtime_config_before = (game/"Renderite.Host.runtimeconfig.json").read_bytes()
+    native_config = linux_runtime_config(game)
     for command in ("c++", "ldd", "cmake", "make"):
         if not shutil.which(command):
             raise SetupError(tr('command_missing', command=command))
@@ -1207,6 +1233,8 @@ def install(args, steam, game, app, state_root):
                     not replaced_bootstrap and data["version"] == VERSION
                     and runtime_matches(data["dotnet_version"], requirement)
                     and local_runtime(game, requirement)
+                    and (game/NATIVE_RUNTIME_CONFIG).is_file()
+                    and (game/NATIVE_RUNTIME_CONFIG).read_bytes() == native_config
                     and patch_bootstrap(original.decode(), data["dotnet_version"]).encode() == original
                 )
                 if current:
@@ -1267,6 +1295,8 @@ def install(args, steam, game, app, state_root):
                 tx.put(game/relative, (compressor/name).read_bytes())
                 tx.data["required"].append(str(relative))
             tx.data["required"] += ["dotnet-runtime-arm64/dotnet", "runtimes/linux-arm64/native/libmikktspace.so"]
+            tx.put(game/NATIVE_RUNTIME_CONFIG, native_config)
+            tx.data["required"].append(NATIVE_RUNTIME_CONFIG)
             tx.put(script, patched, script.stat().st_mode & 0o777)
             tx.put(state_root/"lib/resonite_frame.py", Path(__file__).read_bytes())
             for locale in sorted(LOCALES.glob("*.json")):
@@ -1313,7 +1343,7 @@ def show_check(result, code):
         return tr("check_ok") if value else tr("check_missing")
     lines = [tr("check_ready") if code == 0 else tr("check_incomplete"), "",
         tr("check_runtime", required=result["runtime_required"], installed=result["runtime_version"] or tr("check_none"))]
-    for key in ("installation_complete", "managed_files", "steam_settings_match", "runtime_arm64", "bootstrap_supported", "mikktspace_arm64", "video_launcher"):
+    for key in ("installation_complete", "managed_files", "steam_settings_match", "runtime_arm64", "runtime_configuration", "bootstrap_supported", "mikktspace_arm64", "video_launcher"):
         lines.append(tr("check_item", name=tr("check_" + key), status=status(result[key])))
     for key in ("support_libraries", "video_tools_arm64", "compressonator_arm64"):
         lines.append(tr("check_item", name=tr("check_" + key), status=status(all(result[key].values()))))

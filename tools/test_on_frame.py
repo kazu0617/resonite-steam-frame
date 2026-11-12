@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix="resonite-installer-integration-") as te
     if args.runtime_version:
         runtime_config = {"runtimeOptions": {"tfm": "net" + channel, "framework": {"name": "Microsoft.NETCore.App", "version": required_version}}}
     (fixture/"Renderite.Host.runtimeconfig.json").write_text(json.dumps(runtime_config))
-    bootstrap = '#!/bin/sh\nDOTNET_ROOT="$PWD/dotnet-runtime"\ndotnet() { "$DOTNET_EXECUTABLE" "$@"; }\nbash "$DOTNET_INSTALL_SCRIPT" --verbose --channel ' + channel + ' --runtime dotnet --install-dir "$DOTNET_ROOT"\n'
+    bootstrap = (game/"LinuxBootstrap.sh").read_text()
     (fixture/"LinuxBootstrap.sh").write_text(bootstrap)
     (fixture/"LinuxBootstrap.sh").chmod(0o755)
     media_originals = {
@@ -108,6 +108,11 @@ with tempfile.TemporaryDirectory(prefix="resonite-installer-integration-") as te
         raise RuntimeError(run.stderr)
     manifest = json.loads((state/"manifest.json").read_text())
     assert manifest["status"] == "installed"
+    assert (fixture/"Renderite.Host.runtimeconfig.json").read_text() == json.dumps(runtime_config)
+    native_config = json.loads((fixture/"Renderite.Host.frame.runtimeconfig.json").read_text())
+    native_options = native_config["runtimeOptions"]
+    native_frameworks = native_options.get("frameworks", [native_options.get("framework", {})])
+    assert [f["name"] for f in native_frameworks] == ["Microsoft.NETCore.App"]
     runtime_list = subprocess.run([str(fixture/"dotnet-runtime-arm64/dotnet"), "--list-runtimes"], capture_output=True, text=True)
     assert runtime_list.returncode == 0, runtime_list.stdout + runtime_list.stderr
     assert any(line.split()[:2] == ["Microsoft.NETCore.App", manifest["dotnet_version"]] for line in runtime_list.stdout.splitlines()), runtime_list.stdout
@@ -139,6 +144,7 @@ with tempfile.TemporaryDirectory(prefix="resonite-installer-integration-") as te
     restored = subprocess.run(command + ["--uninstall"], text=True, capture_output=True)
     assert restored.returncode == 0, restored.stdout + restored.stderr
     assert (fixture/"LinuxBootstrap.sh").read_text() == bootstrap
+    assert not (fixture/"Renderite.Host.frame.runtimeconfig.json").exists()
     assert helper.read_bytes() == b"original fixture helper\n"
     assert not (fixture/"runtimes/linux-arm64/native/libmikktspace.so").exists()
     for relative, data in media_originals.items():

@@ -121,6 +121,7 @@
   "check_runtime": ".NET: 要求 {required} / 導入済み {installed}",
   "check_item": "{name}: {status}",
   "check_runtime_arm64": ".NETのARM64対応",
+  "check_runtime_configuration": ".NETの起動設定",
   "check_bootstrap_supported": "起動スクリプト",
   "check_mikktspace_arm64": "モデルのインポート",
   "check_video_launcher": "動画ツールの起動設定",

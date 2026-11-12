@@ -121,6 +121,7 @@
   "check_runtime": ".NET: required {required} / installed {installed}",
   "check_item": "{name}: {status}",
   "check_runtime_arm64": "ARM64 .NET runtime",
+  "check_runtime_configuration": ".NET startup configuration",
   "check_bootstrap_supported": "Startup script",
   "check_mikktspace_arm64": "Model import",
   "check_video_launcher": "Video tool launcher",
