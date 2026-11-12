@@ -20,6 +20,7 @@ parser.add_argument("--game", type=Path, required=True, help="Existing verified 
 parser.add_argument("--source-cache", type=Path, help="Optional verified mikktspace source archive")
 parser.add_argument("--media-cache", type=Path, help="Optional directory of checksum-verified media downloads")
 parser.add_argument("--previous-installer", type=Path, help="Install an older version first to exercise upgrading")
+parser.add_argument("--runtime-version", help="Override the isolated fixture runtime requirement")
 parser.add_argument("--fresh-runtime", action="store_true", help="Download .NET instead of reusing the existing runtime")
 args = parser.parse_args()
 installer = args.installer.resolve()
@@ -38,8 +39,15 @@ with tempfile.TemporaryDirectory(prefix="resonite-installer-integration-") as te
     fixture = steam/"steamapps/common/Resonite"
     fixture.mkdir(parents=True)
     (fixture/"Renderite.Host.dll").write_bytes(b"fixture only, never executed")
-    (fixture/"Renderite.Host.runtimeconfig.json").write_text(json.dumps({"runtimeOptions": {"tfm": "net10.0", "frameworks": [{"name": "Microsoft.NETCore.App", "version": "10.0.0"}]}}))
-    bootstrap = '#!/bin/sh\nDOTNET_ROOT="$PWD/dotnet-runtime"\ndotnet() { "$DOTNET_EXECUTABLE" "$@"; }\nbash "$DOTNET_INSTALL_SCRIPT" --verbose --channel 10.0 --runtime dotnet --install-dir "$DOTNET_ROOT"\n'
+    runtime_config = json.loads((game/"Renderite.Host.runtimeconfig.json").read_text())
+    options = runtime_config["runtimeOptions"]
+    frameworks = options.get("frameworks", [options.get("framework", {})])
+    required_version = args.runtime_version or next(f["version"] for f in frameworks if f["name"] == "Microsoft.NETCore.App")
+    channel = '.'.join(required_version.split('.')[:2])
+    if args.runtime_version:
+        runtime_config = {"runtimeOptions": {"tfm": "net" + channel, "framework": {"name": "Microsoft.NETCore.App", "version": required_version}}}
+    (fixture/"Renderite.Host.runtimeconfig.json").write_text(json.dumps(runtime_config))
+    bootstrap = '#!/bin/sh\nDOTNET_ROOT="$PWD/dotnet-runtime"\ndotnet() { "$DOTNET_EXECUTABLE" "$@"; }\nbash "$DOTNET_INSTALL_SCRIPT" --verbose --channel ' + channel + ' --runtime dotnet --install-dir "$DOTNET_ROOT"\n'
     (fixture/"LinuxBootstrap.sh").write_text(bootstrap)
     (fixture/"LinuxBootstrap.sh").chmod(0o755)
     media_originals = {
@@ -94,12 +102,15 @@ with tempfile.TemporaryDirectory(prefix="resonite-installer-integration-") as te
         previous = subprocess.run(prior, text=True, capture_output=True)
         assert previous.returncode == 0, previous.stdout + previous.stderr
         assert json.loads((state/"manifest.json").read_text())["status"] == "installed"
-    run = subprocess.run(command, text=True, capture_output=True)
+    run = subprocess.run(command + ["--install"], text=True, capture_output=True)
     print(run.stdout, end="")
     if run.returncode:
         raise RuntimeError(run.stderr)
     manifest = json.loads((state/"manifest.json").read_text())
     assert manifest["status"] == "installed"
+    runtime_list = subprocess.run([str(fixture/"dotnet-runtime-arm64/dotnet"), "--list-runtimes"], capture_output=True, text=True)
+    assert runtime_list.returncode == 0, runtime_list.stdout + runtime_list.stderr
+    assert any(line.split()[:2] == ["Microsoft.NETCore.App", manifest["dotnet_version"]] for line in runtime_list.stdout.splitlines()), runtime_list.stdout
     assert manifest["settings_mode"] == "offline"
     assert "-Verbose" in manifest["settings_after"]["launch"]
     assert (fixture/"runtimes/linux-arm64/native/libmikktspace.so").is_file()
@@ -120,8 +131,9 @@ with tempfile.TemporaryDirectory(prefix="resonite-installer-integration-") as te
     assert f'--version {manifest["dotnet_version"]}' in (fixture/"LinuxBootstrap.sh").read_text()
     check = subprocess.run(command + ["--check"], text=True, capture_output=True)
     assert check.returncode == 0, check.stdout + check.stderr
-    again = subprocess.run(command, text=True, capture_output=True)
-    assert again.returncode == 0 and "すでに導入済み" in again.stdout, again.stdout + again.stderr
+    again = subprocess.run(command + ["--install"], text=True, capture_output=True)
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert json.loads((state/"manifest.json").read_text()) == manifest
     # Steam may update unrelated settings after installation. Preserve them.
     local.write_text(local.read_text().replace('"before"', '"after"'))
     restored = subprocess.run(command + ["--uninstall"], text=True, capture_output=True)

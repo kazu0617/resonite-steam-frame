@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/"src"))
 import resonite_frame as rf
 
+FIXTURE_RUNTIME = '11.0.3'
+
 BOOTSTRAP = '''#!/bin/sh
 DOTNET_ROOT="$PWD/dotnet-runtime"
 dotnet() { "$DOTNET_EXECUTABLE" "$@"; }
@@ -23,6 +25,7 @@ bash "$DOTNET_INSTALL_SCRIPT" --verbose --channel 10.0 --runtime dotnet --instal
 
 class InstallerTests(unittest.TestCase):
     def setUp(self):
+        rf.load_language("en")
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
 
@@ -30,16 +33,16 @@ class InstallerTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_bootstrap_known_and_manual_patch_are_idempotent(self):
-        modified = rf.patch_bootstrap(BOOTSTRAP)
-        self.assertEqual(rf.patch_bootstrap(modified), modified)
-        self.assertIn(f'--version {rf.DOTNET_VERSION}', modified)
+        modified = rf.patch_bootstrap(BOOTSTRAP, FIXTURE_RUNTIME)
+        self.assertEqual(rf.patch_bootstrap(modified, FIXTURE_RUNTIME), modified)
+        self.assertIn(f'--version {FIXTURE_RUNTIME}', modified)
         self.assertIn('OPENSSL_MODULES=', modified)
         manual = BOOTSTRAP.replace('dotnet-runtime"', 'dotnet-runtime-arm64"').replace('--runtime dotnet --install-dir', '--runtime dotnet --architecture arm64 --install-dir')
-        self.assertEqual(rf.patch_bootstrap(manual), modified)
+        self.assertEqual(rf.patch_bootstrap(manual, FIXTURE_RUNTIME), modified)
 
     def test_changed_bootstrap_fails_without_guessing(self):
         with self.assertRaises(rf.SetupError):
-            rf.patch_bootstrap(BOOTSTRAP.replace('--channel 10.0', '--channel 11.0'))
+            rf.patch_bootstrap(BOOTSTRAP.replace('--runtime dotnet', '--runtime unknown'), FIXTURE_RUNTIME)
 
     def test_vdf_roundtrip_quotes_backslashes_and_unicode(self):
         original = {'root': {'path': 'C:\\ゲーム\\models', 'quote': '"hello"', 'newline': 'a\nb', 'unknown': '\\q'}}
@@ -210,7 +213,7 @@ class InstallerTests(unittest.TestCase):
         deno.chmod(0o755)
         launcher = game/'RuntimeData/yt-dlp_linux'
         launcher.parent.mkdir()
-        launcher.write_text(rf.VIDEO_LAUNCHER)
+        launcher.write_text(rf.video_launcher())
         launcher.chmod(0o755)
         update = subprocess.run([str(launcher), '-U', '--update-to', 'nightly'], text=True, capture_output=True)
         self.assertEqual(update.returncode, 0)
@@ -233,12 +236,12 @@ class InstallerTests(unittest.TestCase):
         game.mkdir(parents=True)
         (game/'LinuxBootstrap.sh').write_text(BOOTSTRAP)
         (game/'Renderite.Host.dll').write_bytes(b'fixture only')
-        tfm = 'net' + '.'.join(rf.DOTNET_VERSION.split('.')[:2])
-        (game/'Renderite.Host.runtimeconfig.json').write_text(json.dumps({'runtimeOptions': {'tfm': tfm, 'framework': {'name': 'Microsoft.NETCore.App', 'version': rf.DOTNET_VERSION}}}))
+        tfm = 'net' + '.'.join(FIXTURE_RUNTIME.split('.')[:2])
+        (game/'Renderite.Host.runtimeconfig.json').write_text(json.dumps({'runtimeOptions': {'tfm': tfm, 'framework': {'name': 'Microsoft.NETCore.App', 'version': FIXTURE_RUNTIME}}}))
         header = bytearray(64)
         header[:6] = b'\x7fELF\x02\x01'
         header[18:20] = (183).to_bytes(2, 'little')
-        required = ['dotnet-runtime-arm64/dotnet', f'dotnet-runtime-arm64/shared/Microsoft.NETCore.App/{rf.DOTNET_VERSION}/libcoreclr.so',
+        required = ['dotnet-runtime-arm64/dotnet', f'dotnet-runtime-arm64/shared/Microsoft.NETCore.App/{FIXTURE_RUNTIME}/libcoreclr.so',
             'runtimes/linux-arm64/native/libmikktspace.so', 'dotnet-runtime-arm64/tools/yt-dlp_linux_aarch64', 'dotnet-runtime-arm64/tools/deno']
         required += ['runtimes/linux-arm64/native/' + name for name in rf.CMP_LIBS]
         required += ['frame-libs-arm64/' + name for name in ('libicuuc.so', 'libssl.so.3', 'libcrypto.so.3', 'libpulse.so.0', 'ossl-modules/legacy.so', 'openssl.cnf')]
@@ -263,9 +266,11 @@ class InstallerTests(unittest.TestCase):
         args = SimpleNamespace(user_id=None, bin_dir=str(self.root/'bin'))
         return steam, game, app, self.root/'state', args
 
-    def install_fixture(self, steam, game, app, state, args):
+    def install_fixture(self, steam, game, app, state, args, mock_runtime=True):
+        from contextlib import nullcontext
+        runtime_mock = patch.object(rf, "stage_runtime", return_value=(None, FIXTURE_RUNTIME)) if mock_runtime else nullcontext()
         with patch.object(rf, 'game_running', return_value=False), patch.object(rf, 'steam_running', return_value=False), \
-             patch.object(rf, 'stage_host_libraries'), patch.object(rf, 'stage_runtime', return_value=None), \
+             patch.object(rf, 'stage_host_libraries'), runtime_mock, \
              patch.object(rf, 'stage_mikk', return_value=None), \
              patch.object(rf, 'stage_video', return_value=game/'dotnet-runtime-arm64/tools'), \
              patch.object(rf, 'stage_compressonator', return_value=game/'runtimes/linux-arm64/native'), \
@@ -333,6 +338,190 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual((game/'LinuxBootstrap.sh').read_text(), BOOTSTRAP)
         self.assertFalse(module.exists())
         self.assertEqual(json.loads(path.read_text())['status'], 'uninstalled')
+
+    def test_locales_have_matching_keys_and_format_parameters(self):
+        import string
+        data = {p.stem: json.loads(p.read_text()) for p in rf.LOCALES.glob('*.json')}
+        self.assertEqual(set(data['ja']), set(data['en']))
+        formatter = string.Formatter()
+        for key in data['en']:
+            fields = lambda text: {field for _, field, _, _ in formatter.parse(text) if field is not None}
+            self.assertEqual(fields(data['ja'][key]), fields(data['en'][key]), key)
+        for language in data:
+            rf.load_language(language)
+            self.assertIn('12.0.0', rf.tr('runtime_preparing', version='12.0.0'))
+        self.assertEqual(rf.load_language('unknown'), 'en')
+        self.assertEqual(rf.load_language('../ja'), 'en')
+        self.assertEqual(rf.load_language('japanese'), 'ja')
+
+    def test_steam_language_uses_live_client_then_offline_registry(self):
+        steam = self.root/'Steam'
+        (steam/'steamapps').mkdir(parents=True)
+        registry = self.root/'.steam/registry.vdf'
+        registry.parent.mkdir()
+        registry.write_text(rf.vdf_dump({'Registry': {'HKCU': {'Software': {'Valve': {'Steam': {'language': 'japanese'}}}}}}))
+        with patch.object(rf.Path, 'home', return_value=self.root), patch.object(rf, 'steam_running', return_value=True), patch.object(rf, 'cdp', return_value='english') as live:
+            self.assertEqual(rf.steam_language(steam), 'english')
+            self.assertEqual(live.call_count, 1)
+        with patch.object(rf.Path, 'home', return_value=self.root), patch.object(rf, 'steam_running', return_value=False), patch.object(rf, 'cdp') as live:
+            self.assertEqual(rf.steam_language(steam), 'japanese')
+            live.assert_not_called()
+        registry.unlink()
+        with patch.object(rf.Path, 'home', return_value=self.root), patch.object(rf, 'steam_running', return_value=False):
+            self.assertEqual(rf.steam_language(steam), 'english')
+
+    def test_runtime_requirements_select_latest_patch_for_each_requested_series(self):
+        def release(version, rid='linux-arm64'):
+            return {'runtime': {'version': version, 'files': [{'rid': rid, 'name': 'dotnet-runtime-linux-arm64.tar.gz'}]}}
+        metadata = {'releases': [release(v) for v in ('10.0.9', '10.0.12', '11.0.0', '11.0.7', '11.0.20-preview.1', '12.0.1')]}
+        for required, selected in [('10.0.0', '10.0.12'), ('11.0.0', '11.0.7'), ('12.0.0', '12.0.1')]:
+            result = rf.select_runtime_release(metadata, {'version': required, 'exact': False})
+            self.assertEqual(result['runtime']['version'], selected)
+        exact = rf.select_runtime_release(metadata, {'version': '11.0.0', 'exact': True})
+        self.assertEqual(exact['runtime']['version'], '11.0.0')
+        with self.assertRaises(rf.SetupError):
+            rf.select_runtime_release(metadata, {'version': '11.0.8', 'exact': False})
+        with self.assertRaises(rf.SetupError):
+            rf.select_runtime_release({'releases': [release('11.0.3', 'linux-x64')]}, {'version': '11.0.0', 'exact': False})
+
+    def test_runtime_config_honors_exact_and_explicit_rollforward(self):
+        game = self.root/'game'
+        game.mkdir()
+        path = game/'Renderite.Host.runtimeconfig.json'
+        def requirement(version='11.0.0', **options):
+            path.write_text(json.dumps({'runtimeOptions': {'tfm': 'net' + '.'.join(version.split('.')[:2]), 'framework': {'name': 'Microsoft.NETCore.App', 'version': version}, **options}}))
+            return rf.runtime_requirement(game)
+        self.assertEqual(requirement(), {'version': '11.0.0', 'exact': False})
+        self.assertTrue(requirement(rollForward='Disable')['exact'])
+        self.assertTrue(requirement(applyPatches=False)['exact'])
+        self.assertFalse(requirement(applyPatches=False, rollForward='LatestPatch')['exact'])
+        self.assertTrue(requirement('11.0.0-rc.2')['exact'])
+        with self.assertRaises(rf.SetupError):
+            requirement(rollForward='unknown')
+        path.write_text(json.dumps({'runtimeOptions': {'frameworks': [{'name': 'Microsoft.NETCore.App', 'version': '11.0.0'}, {'name': 'Microsoft.WindowsDesktop.App', 'version': '11.0.0'}]}}))
+        with self.assertRaises(rf.SetupError):
+            rf.runtime_requirement(game)
+
+    def test_bootstrap_accepts_future_channel_and_changes_pinned_runtime(self):
+        for channel in ('11.0', '12.0'):
+            version = channel + '.4'
+            original = BOOTSTRAP.replace('--channel 10.0', '--channel ' + channel)
+            modified = rf.patch_bootstrap(original, version)
+            self.assertIn('--version ' + version, modified)
+            newer = rf.patch_bootstrap(modified, channel + '.5')
+            self.assertIn('--version ' + channel + '.5', newer)
+
+    def test_stage_runtime_reuses_compatible_local_runtime_without_network(self):
+        steam, game, app, state, args = self.make_steam_fixture()
+        with patch.object(rf, 'download') as download:
+            path, version = rf.stage_runtime(game, self.root/'stage', self.root/'cache', {'version': '11.0.0', 'exact': False})
+        self.assertIsNone(path)
+        self.assertEqual(version, FIXTURE_RUNTIME)
+        download.assert_not_called()
+
+    def test_fresh_runtime_uses_requested_metadata_and_checksum(self):
+        import hashlib
+        steam, game, app, state, args = self.make_steam_fixture()
+        header = (game/'dotnet-runtime-arm64/dotnet').read_bytes()
+        archive = self.root/'runtime.tar.gz'
+        with tarfile.open(archive, 'w:gz') as tar:
+            for name in ('dotnet', 'shared/Microsoft.NETCore.App/12.0.2/libcoreclr.so'):
+                member = tarfile.TarInfo(name)
+                member.size = len(header)
+                member.mode = 0o755
+                tar.addfile(member, io.BytesIO(header))
+        payload = archive.read_bytes()
+        checksum = hashlib.sha512(payload).hexdigest()
+        item = {'rid': 'linux-arm64', 'name': 'dotnet-runtime-linux-arm64.tar.gz', 'url': 'https://builds.dotnet.microsoft.com/runtime.tar.gz', 'hash': checksum}
+        metadata = {'releases': [{'runtime': {'version': '12.0.2', 'files': [item]}}]}
+        downloads = []
+        def download(url, target, expected=None, algorithm='sha256'):
+            downloads.append((url, expected, algorithm))
+            rf.atomic(target, json.dumps(metadata).encode() if url.endswith('releases.json') else payload)
+        with patch.object(rf, 'download', side_effect=download):
+            runtime, version = rf.stage_runtime(game, self.root/'stage', self.root/'cache', {'version': '12.0.0', 'exact': False})
+        self.assertEqual(version, '12.0.2')
+        self.assertTrue(rf.elf_arm64(runtime/'dotnet'))
+        self.assertIn('/12.0/releases.json', downloads[0][0])
+        self.assertEqual(downloads[1][1:], (checksum, 'sha512'))
+
+    def test_same_installer_updates_runtime_after_game_update_and_restores_new_bootstrap(self):
+        steam, game, app, state, args = self.make_steam_fixture()
+        self.install_fixture(steam, game, app, state, args)
+        updated = BOOTSTRAP.replace('10.0', '12.0') + '# new game version\n'
+        (game/'LinuxBootstrap.sh').write_text(updated)
+        config = game/'Renderite.Host.runtimeconfig.json'
+        config.write_text(json.dumps({'runtimeOptions': {'tfm': 'net12.0', 'framework': {'name': 'Microsoft.NETCore.App', 'version': '12.0.0'}}}))
+        stage = self.root/'new-runtime'
+        core = stage/'shared/Microsoft.NETCore.App/12.0.2/libcoreclr.so'
+        core.parent.mkdir(parents=True)
+        core.write_bytes((game/'dotnet-runtime-arm64/dotnet').read_bytes())
+        (stage/'dotnet').write_bytes(core.read_bytes())
+        with patch.object(rf, 'stage_runtime', return_value=(stage, '12.0.2')):
+            self.install_fixture(steam, game, app, state, args, mock_runtime=False)
+        data = json.loads((state/'manifest.json').read_text())
+        self.assertEqual(data['dotnet_version'], '12.0.2')
+        self.assertIn('--version 12.0.2', (game/'LinuxBootstrap.sh').read_text())
+        self.assertTrue((state/'lib/locales/ja.json').is_file())
+        with patch.object(rf, 'game_running', return_value=False), patch.object(rf, 'steam_running', return_value=False):
+            rf.uninstall(state)
+        self.assertEqual((game/'LinuxBootstrap.sh').read_text(), updated)
+        self.assertFalse((game/'dotnet-runtime-arm64/shared/Microsoft.NETCore.App/12.0.2/libcoreclr.so').exists())
+
+    def test_management_menu_first_install_recovery_and_cancel(self):
+        state = self.root/'state'
+        self.assertEqual(rf.menu_action(state), 'install')
+        state.mkdir()
+        path = state/'manifest.json'
+        path.write_text(json.dumps({'status': 'uninstalled'}))
+        self.assertEqual(rf.menu_action(state), 'install')
+        for phase in ('installed', 'failed', 'applying'):
+            path.write_text(json.dumps({'status': phase}))
+            with patch.object(sys.stdin, 'isatty', return_value=True), patch.object(sys.stderr, 'isatty', return_value=True), patch.object(rf.shutil, 'which', return_value='/usr/bin/whiptail'), patch.object(rf.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stderr='check\n')) as run:
+                self.assertEqual(rf.menu_action(state), 'check')
+                command = run.call_args.args[0]
+                self.assertEqual('install' in command, phase == 'installed')
+            with patch.object(sys.stdin, 'isatty', return_value=True), patch.object(sys.stderr, 'isatty', return_value=True), patch.object(rf.shutil, 'which', return_value='/usr/bin/whiptail'), patch.object(rf.subprocess, 'run', return_value=SimpleNamespace(returncode=1, stderr='')):
+                self.assertEqual(rf.menu_action(state), 'exit')
+        with patch.object(sys.stdin, 'isatty', return_value=False), patch.object(rf.subprocess, 'run') as run:
+            with self.assertRaises(rf.SetupError):
+                rf.menu_action(state)
+            run.assert_not_called()
+
+    def test_menu_keeps_screen_output_separate_from_selected_action(self):
+        state = self.root/'state'
+        state.mkdir()
+        (state/'manifest.json').write_text(json.dumps({'status': 'installed'}))
+        program = self.root/'whiptail'
+        program.write_text('#!/bin/sh\nprintf "visible menu\\n"\nprintf "check" >&2\n')
+        program.chmod(0o755)
+        screen = self.root/'screen'
+        with screen.open('w') as terminal, patch.object(terminal, 'isatty', return_value=True), patch.object(sys, 'stderr', terminal), patch.object(sys.stdin, 'isatty', return_value=True), patch.dict(rf.os.environ, {'PATH': str(self.root)}):
+            self.assertEqual(rf.menu_action(state), 'check')
+        self.assertEqual(screen.read_text(), 'visible menu\n')
+
+    def test_main_routes_menu_and_explicit_actions(self):
+        state = self.root/'state'
+        options = ['--state-dir', str(state), '--language', 'en']
+        with patch.object(rf.platform, 'machine', return_value='aarch64'), patch.object(rf.os, 'geteuid', return_value=1000), patch.object(rf, 'menu_action', return_value='exit') as menu:
+            self.assertEqual(rf.main(options), 0)
+            self.assertFalse(state.exists())
+            with patch.object(rf, 'steam_root', return_value=self.root), patch.object(rf, 'find_game', return_value=(self.root, {})), patch.object(rf, 'check', return_value=0) as check:
+                self.assertEqual(rf.main(options + ['--check']), 0)
+                check.assert_called_once()
+            self.assertEqual(menu.call_count, 1)
+
+    def test_check_accepts_additional_compatible_patch_without_network(self):
+        steam, game, app, state, args = self.make_steam_fixture()
+        self.install_fixture(steam, game, app, state, args)
+        new = game/'dotnet-runtime-arm64/shared/Microsoft.NETCore.App/11.0.8/libcoreclr.so'
+        new.parent.mkdir()
+        new.write_bytes((game/'dotnet-runtime-arm64/dotnet').read_bytes())
+        with patch.object(rf, 'download') as download:
+            result, code = rf.check_report(game, app, state)
+        self.assertEqual(code, 0)
+        self.assertEqual(result['runtime_version'], '11.0.8')
+        download.assert_not_called()
 
 if __name__ == '__main__':
     unittest.main()

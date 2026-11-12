@@ -12,21 +12,21 @@ Steam FrameにSteam版ResoniteとProton Experimentalをインストールして�
 curl -fsSL https://raw.githubusercontent.com/kazu0617/resonite-steam-frame/main/install.sh -o install-resonite-frame.sh && bash install-resonite-frame.sh
 ```
 
-導入には数分かかります。完了後はSteamからResoniteを起動してください。更新時も同じコマンドを使います。
+初回はそのまま導入が始まります。数分で完了したら、SteamからResoniteを起動してください。必要な.NETは、Resoniteの要求に合わせて自動で選びます。
 
-## チェックと復元
+2回目以降は同じコマンドで操作メニューが開き、更新・チェック・導入前への復元を選べます。表示言語はSteamの設定に合わせて日本語・英語を切り替えます。
 
-導入状態を確認します。Resoniteの起動中でも実行できます。
+## コマンドで直接操作する
 
-```bash
-bash install-resonite-frame.sh --check
-```
-
-導入前に戻すには、Resoniteを終了して次のコマンドを実行してください。Steamの起動・終了状態は、導入したときとそろえてください。
+メニューを開かずに操作することもできます。チェックはResoniteの起動中でも実行できます。
 
 ```bash
-bash install-resonite-frame.sh --uninstall
+bash install-resonite-frame.sh --install    # 導入・更新
+bash install-resonite-frame.sh --check      # チェック
+bash install-resonite-frame.sh --uninstall  # 導入前に戻す
 ```
+
+復元するときはResoniteを終了し、Steamの起動・終了状態を導入時とそろえてください。
 
 ## 詳しい記録
 
