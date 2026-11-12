@@ -14,7 +14,9 @@ curl -fsSL https://raw.githubusercontent.com/kazu0617/resonite-steam-frame/main/
 
 初回はそのまま導入が始まります。数分で完了したら、SteamからResoniteを起動してください。必要な.NETは、Resoniteの要求に合わせて自動で選びます。
 
-2回目以降は同じコマンドで操作メニューが開き、更新・チェック・導入前への復元を選べます。表示言語はSteamの設定に合わせて日本語・英語を切り替えます。
+2回目以降は以下の画面が表示されます。
+
+![Resonite on Steam Frameの操作メニュー](docs/images/menu.ja.jpg)
 
 ## コマンドで直接操作する
 
