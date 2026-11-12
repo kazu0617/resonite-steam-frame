@@ -30,11 +30,6 @@ bash install-resonite-frame.sh --uninstall  # 導入前に戻す
 
 復元するときはResoniteを終了し、Steamの起動・終了状態を導入時とそろえてください。
 
-## 詳しい記録
-
-- [調査と修正の記録](docs/investigation.ja.md)
-- [テスト・開発手順](docs/testing.ja.md)
-
 ## ライセンス・外部ソース
 
 - 本ツールのコードは[MIT License](LICENSE)です。
