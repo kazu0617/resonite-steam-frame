@@ -1,6 +1,6 @@
 # 仕組み（内部動作）
 
-このドキュメントは、`install.sh` / `src/resonite_frame.py` が Steam Frame 上で何をしているかを、コードに基づいて整理したものです。利用方法は [README](../README.md) を参照してください。
+このドキュメントは、`install.sh` / `src/resonite_frame.py` が Steam Frame 上で何をしているかを、コードに基づいて整理したものです。利用方法は [README](../README.md) を参照してください。英語版は [how-it-works.md](how-it-works.md) です。
 
 - 対象バージョン: `VERSION = "0.3.2"`（`src/resonite_frame.py`）
 - 対象アプリ: Steam App ID `2519830`（Resonite）
